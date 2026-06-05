@@ -1,0 +1,979 @@
+{
+  "info": {
+    "name": "LLEO v2 — Complete API Collection",
+    "description": "Full API collection for LLEO (Large Language Models for Earth Observation).\n\nSwitch between LOCAL and CLOUD by changing the `base_url` variable.\n\n**Environments:**\n- LOCAL: http://localhost:8080\n- CLOUD: https://ndvi6-analysis-api-258557095482.us-central1.run.app\n\n**External Services:**\n- Supabase: https://quvbsftdyaxjqlwnjtxv.supabase.co\n- Stripe: https://api.stripe.com",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080",
+      "description": "LOCAL backend. Change to cloud URL for production."
+    },
+    {
+      "key": "cloud_url",
+      "value": "https://ndvi6-analysis-api-258557095482.us-central1.run.app",
+      "description": "Cloud Run production URL"
+    },
+    {
+      "key": "supabase_url",
+      "value": "https://quvbsftdyaxjqlwnjtxv.supabase.co",
+      "description": "Supabase project URL"
+    },
+    {
+      "key": "supabase_anon_key",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF1dmJzZnRkeWF4anFsd25qdHh2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA1MzI0OTEsImV4cCI6MjA3NjEwODQ5MX0.BpxqHKTvmSghuNDtLAKU-hszFJzey_oyn5_hDRZeqTg",
+      "description": "Supabase anon/public key"
+    },
+    {
+      "key": "supabase_service_role_key",
+      "value": "YOUR_SERVICE_ROLE_KEY_HERE",
+      "description": "Supabase service role key (admin). Get from GCP Secret Manager."
+    },
+    {
+      "key": "stripe_secret_key",
+      "value": "YOUR_STRIPE_SECRET_KEY_HERE",
+      "description": "Stripe secret key (sk_live_...). Get from Stripe Dashboard."
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "description": "Set automatically after /chat/start"
+    },
+    {
+      "key": "analysis_session_id",
+      "value": "",
+      "description": "Set automatically after /chat/analyze"
+    },
+    {
+      "key": "user_id",
+      "value": "test-user-123",
+      "description": "Test user ID (use a real Supabase user ID for billing tests)"
+    },
+    {
+      "key": "user_email",
+      "value": "test@example.com",
+      "description": "Test user email"
+    }
+  ],
+  "item": [
+    {
+      "name": "🏥 Health & Info",
+      "description": "Service health, info, and debugging endpoints.",
+      "item": [
+        {
+          "name": "GET / — Service Info",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/",
+            "description": "Returns service info, version, features, and available endpoints."
+          }
+        },
+        {
+          "name": "GET /health — Deep Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "Deep health check — checks database, storage, Vertex AI, and Earth Engine."
+          }
+        },
+        {
+          "name": "GET /processors — List Processors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/processors",
+            "description": "List all available analysis processors (ndvi, air_quality, water_quality, etc.)."
+          }
+        },
+        {
+          "name": "GET /processors/{type} — Processor Detail",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/processors/air_quality",
+            "description": "Details for a specific processor. Try: ndvi, air_quality, water_quality, weather_forecast, business_location"
+          }
+        },
+        {
+          "name": "GET /api/logs — Cloud Run Logs",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/logs?limit=50",
+              "host": ["{{base_url}}"],
+              "path": ["api", "logs"],
+              "query": [
+                { "key": "limit", "value": "50", "description": "Max logs to return (1-500)" }
+              ]
+            },
+            "description": "Fetch recent Cloud Run logs from Cloud Logging (last 1 hour)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "💬 Chat — Conversational Flow",
+      "description": "The main conversational analysis flow.\n\nFlow: start → continue (optional, for clarifications) → analyze → poll status",
+      "item": [
+        {
+          "name": "POST /chat/start — Start Conversation",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.session_id) {",
+                  "    pm.collectionVariables.set('session_id', jsonData.session_id);",
+                  "    console.log('✅ session_id saved: ' + jsonData.session_id);",
+                  "}",
+                  "",
+                  "pm.test('Status code is 200', function() {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Has session_id', function() {",
+                  "    pm.expect(jsonData).to.have.property('session_id');",
+                  "});",
+                  "",
+                  "pm.test('Has status', function() {",
+                  "    pm.expect(jsonData).to.have.property('status');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/chat/start",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "query", "value": "air pollution levels in Holcim cement factory in Beočin, Serbia 2024", "description": "The user's question" },
+                { "key": "user_id", "value": "{{user_id}}", "description": "User ID" },
+                { "key": "user_email", "value": "{{user_email}}", "description": "User email (optional)" }
+              ]
+            },
+            "description": "Start a new conversation. Saves session_id to collection variables automatically.\n\n**Sample queries to try:**\n- Vegetation: `Vegetation change in Fazenda Rio Preto I farm in Mato Grosso, Brazil in 2024`\n- Air Quality: `air pollution levels in Holcim cement factory in Beočin, Serbia 2024`\n- Water Quality: `Water quality in Henley Sewage Treatment Works in 2024`\n- Weather: `weather forecast Tokyo Japan`\n- Business: `find coffee shops near Zurich`\n- General: `what satellite data can you analyze?`"
+          }
+        },
+        {
+          "name": "POST /chat/continue — Follow-up Message",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.session_id) {",
+                  "    pm.collectionVariables.set('session_id', jsonData.session_id);",
+                  "}",
+                  "",
+                  "pm.test('Status code is 200', function() {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/chat/continue",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "session_id", "value": "{{session_id}}", "description": "Session ID from /chat/start" },
+                { "key": "message", "value": "all pollutants please", "description": "Follow-up message (e.g. answering clarification)" }
+              ]
+            },
+            "description": "Continue a conversation with a follow-up message.\n\nUse this when LLEO asks for clarification (e.g. 'which pollutants?').\n\nAlso accepts `conversation_id` + `user_response` as legacy field names."
+          }
+        },
+        {
+          "name": "POST /chat/analyze — Trigger Analysis",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.session_id) {",
+                  "    pm.collectionVariables.set('analysis_session_id', jsonData.session_id);",
+                  "    console.log('✅ analysis_session_id saved: ' + jsonData.session_id);",
+                  "}",
+                  "",
+                  "pm.test('Status code is 200', function() {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Has analysis session_id', function() {",
+                  "    pm.expect(jsonData).to.have.property('session_id');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/chat/analyze",
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "session_id", "value": "{{session_id}}", "description": "Session ID from /chat/start or /chat/continue" }
+              ]
+            },
+            "description": "Trigger the actual satellite analysis after the conversation is complete.\n\nReturns an `analysis_session_id` to poll with /status/{session_id}.\n\n⚠️ This is the ANALYSIS session_id, not the chat session_id."
+          }
+        },
+        {
+          "name": "GET /chat/{session_id} — Get Session State",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/chat/{{session_id}}",
+            "description": "Retrieve current conversation state including messages, intent, and location."
+          }
+        }
+      ]
+    },
+    {
+      "name": "🔬 Analysis — Legacy Direct",
+      "description": "Legacy one-shot analysis endpoint (no conversation).",
+      "item": [
+        {
+          "name": "POST /analyze — Direct Analysis",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.session_id) {",
+                  "    pm.collectionVariables.set('analysis_session_id', jsonData.session_id);",
+                  "    console.log('✅ analysis_session_id saved: ' + jsonData.session_id);",
+                  "}",
+                  "",
+                  "pm.test('Status code is 200', function() {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/analyze",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "query", "value": "Vegetation change in Mato Grosso, Brazil 2024", "description": "Analysis query" },
+                { "key": "user_id", "value": "{{user_id}}", "description": "User ID" },
+                { "key": "download_data", "value": "true", "description": "Whether to download raw data" }
+              ]
+            },
+            "description": "Legacy one-shot analysis. Routes, geocodes, and launches analysis in one call.\n\nWill fail with 400 if clarification is needed — use /chat/start instead."
+          }
+        }
+      ]
+    },
+    {
+      "name": "📊 Status & Results",
+      "description": "Poll analysis progress and retrieve results.",
+      "item": [
+        {
+          "name": "GET /status/{session_id} — Poll Progress",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/status/{{analysis_session_id}}",
+            "description": "Poll analysis progress. Returns status: processing | completed | failed.\n\nWhen completed, includes file URLs.\n\n⏳ Poll every 5 seconds until status is 'completed' or 'failed'."
+          }
+        },
+        {
+          "name": "GET /results/{session_id}/map — Interactive Map",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/results/{{analysis_session_id}}/map",
+            "description": "Returns the interactive Folium map as HTML. Open in browser."
+          }
+        },
+        {
+          "name": "GET /results/{session_id}/chart — Chart Image",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/results/{{analysis_session_id}}/chart",
+            "description": "Returns the analysis chart as a PNG image."
+          }
+        },
+        {
+          "name": "GET /results/{session_id}/preview — Thumbnail",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/results/{{analysis_session_id}}/preview",
+            "description": "Returns a thumbnail preview image of the analysis."
+          }
+        },
+        {
+          "name": "GET /results/{session_id}/metadata — JSON Metadata",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/results/{{analysis_session_id}}/metadata",
+            "description": "Returns analysis metadata: query, type, location, coordinates, timestamps, results_data."
+          }
+        },
+        {
+          "name": "GET /results/{session_id}/download — ZIP Archive",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/results/{{analysis_session_id}}/download",
+            "description": "Download all analysis files as a ZIP archive."
+          }
+        },
+        {
+          "name": "DELETE /results/{session_id} — Delete Analysis",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{base_url}}/results/{{analysis_session_id}}?user_id={{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["results", "{{analysis_session_id}}"],
+              "query": [
+                { "key": "user_id", "value": "{{user_id}}", "description": "Must match the owner" }
+              ]
+            },
+            "description": "Delete an analysis and its files. User must own the analysis."
+          }
+        },
+        {
+          "name": "GET /gallery/{user_id} — User Gallery",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/gallery/{{user_id}}?limit=50&offset=0",
+              "host": ["{{base_url}}"],
+              "path": ["gallery", "{{user_id}}"],
+              "query": [
+                { "key": "limit", "value": "50", "description": "Max results (1-500)" },
+                { "key": "offset", "value": "0", "description": "Pagination offset" }
+              ]
+            },
+            "description": "List all analyses for a user with thumbnail/map/chart URLs."
+          }
+        },
+        {
+          "name": "GET /files/{session_id}/{filename} — Serve File",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/files/{{analysis_session_id}}/map.html",
+            "description": "Serve any artefact file from GCS or local disk. Replace filename as needed."
+          }
+        }
+      ]
+    },
+    {
+      "name": "💳 Stripe — Billing & Subscriptions",
+      "description": "Stripe billing endpoints. These are called by the frontend BillingPage.",
+      "item": [
+        {
+          "name": "POST /api/billing/create-checkout-session",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/billing/create-checkout-session",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "User's email for Stripe customer" },
+                { "key": "user_id", "value": "{{user_id}}", "description": "User ID (stored in Stripe metadata)" }
+              ]
+            },
+            "description": "Create a Stripe Checkout session for Pro subscription ($1/month).\n\nReturns `checkout_url` — redirect the user to this URL."
+          }
+        },
+        {
+          "name": "POST /api/billing/create-portal-session",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/billing/create-portal-session",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "User's email (must have existing Stripe customer)" }
+              ]
+            },
+            "description": "Create a Stripe Customer Portal session.\n\nReturns `portal_url` — redirect user to manage their subscription."
+          }
+        },
+        {
+          "name": "POST /api/billing/cancel-subscription",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/billing/cancel-subscription",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "User's email" }
+              ]
+            },
+            "description": "Cancel the user's active subscription at end of billing period.\n\nDoes NOT immediately cancel — subscription stays active until period ends."
+          }
+        },
+        {
+          "name": "POST /api/billing/reactivate-subscription",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/billing/reactivate-subscription",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "User's email" }
+              ]
+            },
+            "description": "Reactivate a subscription that was set to cancel at period end."
+          }
+        },
+        {
+          "name": "POST /api/stripe/webhook — Stripe Webhook",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/stripe/webhook",
+            "header": [
+              { "key": "stripe-signature", "value": "t=...,v1=...", "description": "Stripe webhook signature (auto-set by Stripe)" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"customer.subscription.created\",\n  \"data\": {\n    \"object\": {\n      \"id\": \"sub_test\",\n      \"customer\": \"cus_test\",\n      \"status\": \"active\"\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "⚠️ This endpoint is called by Stripe, not by you.\n\nHandled events:\n- customer.subscription.created\n- customer.subscription.updated\n- customer.subscription.deleted\n- invoice.payment_succeeded\n- invoice.payment_failed\n\n**Webhook URL for Stripe Dashboard:**\n- LOCAL: Use Stripe CLI `stripe listen --forward-to localhost:8080/api/stripe/webhook`\n- CLOUD: `https://ndvi6-analysis-api-258557095482.us-central1.run.app/api/stripe/webhook`"
+          }
+        },
+        {
+          "name": "GET /credits/{user_id} — User Credits",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/credits/{{user_id}}",
+            "description": "Get user's remaining credits from Supabase."
+          }
+        }
+      ]
+    },
+    {
+      "name": "📧 Email",
+      "description": "Email endpoints using Resend API.",
+      "item": [
+        {
+          "name": "POST /api/email/welcome — Send Welcome Email",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/email/welcome",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "New user's email" },
+                { "key": "credits", "value": "20", "description": "Credits granted (default: 20)" }
+              ]
+            },
+            "description": "Send a welcome email to a new user after signup."
+          }
+        },
+        {
+          "name": "POST /api/email/password-reset — Send Password Reset",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/api/email/password-reset",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "user_email", "value": "{{user_email}}", "description": "User's email" },
+                { "key": "reset_link", "value": "https://lleo.earth/reset?token=abc123", "description": "Password reset link" }
+              ]
+            },
+            "description": "Send a password reset email."
+          }
+        }
+      ]
+    },
+    {
+      "name": "🗄️ Supabase — Direct API",
+      "description": "Direct Supabase REST API calls. Uses the anon key for read-only, service role key for admin.\n\n**These bypass the LLEO backend** — they go directly to Supabase.",
+      "item": [
+        {
+          "name": "GET analyses — List All (public)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/analyses?select=*&is_shared=eq.true&order=created_at.desc&limit=20",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "analyses"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "is_shared", "value": "eq.true" },
+                { "key": "order", "value": "created_at.desc" },
+                { "key": "limit", "value": "20" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "List shared analyses from Supabase (community page data)."
+          }
+        },
+        {
+          "name": "GET analyses — By User ID",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/analyses?select=*&user_id=eq.{{user_id}}&order=created_at.desc&limit=50",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "analyses"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "user_id", "value": "eq.{{user_id}}" },
+                { "key": "order", "value": "created_at.desc" },
+                { "key": "limit", "value": "50" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "List all analyses for a specific user."
+          }
+        },
+        {
+          "name": "GET user_credits — Check Credits",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/user_credits?select=*&user_id=eq.{{user_id}}",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "user_credits"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "user_id", "value": "eq.{{user_id}}" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "Check a user's credit balance."
+          }
+        },
+        {
+          "name": "GET subscriptions — Check Subscription",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/subscriptions?select=*&user_id=eq.{{user_id}}",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "subscriptions"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "user_id", "value": "eq.{{user_id}}" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "Check a user's subscription status (free/pro/enterprise, active/canceled)."
+          }
+        },
+        {
+          "name": "GET credit_transactions — Transaction History",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/credit_transactions?select=*&user_id=eq.{{user_id}}&order=created_at.desc&limit=20",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "credit_transactions"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "user_id", "value": "eq.{{user_id}}" },
+                { "key": "order", "value": "created_at.desc" },
+                { "key": "limit", "value": "20" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "Get credit transaction history for a user."
+          }
+        },
+        {
+          "name": "GET conversation_messages — Chat History",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/conversation_messages?select=*&conversation_id=eq.YOUR_CONVERSATION_ID&order=created_at.asc",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "conversation_messages"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "conversation_id", "value": "eq.YOUR_CONVERSATION_ID" },
+                { "key": "order", "value": "created_at.asc" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "Get all messages in a conversation thread. Replace YOUR_CONVERSATION_ID with actual conversation_id from an analysis."
+          }
+        },
+        {
+          "name": "GET analysis_likes — Check Likes",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/analysis_likes?select=*&user_id=eq.{{user_id}}",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "analysis_likes"],
+              "query": [
+                { "key": "select", "value": "*" },
+                { "key": "user_id", "value": "eq.{{user_id}}" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_anon_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_anon_key}}" }
+            ],
+            "description": "Get all analyses liked by a user."
+          }
+        },
+        {
+          "name": "PATCH analyses — Share/Unshare (Admin)",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{supabase_url}}/rest/v1/analyses?id=eq.123",
+              "host": ["{{supabase_url}}"],
+              "path": ["rest", "v1", "analyses"],
+              "query": [
+                { "key": "id", "value": "eq.123", "description": "Analysis ID to update" }
+              ]
+            },
+            "header": [
+              { "key": "apikey", "value": "{{supabase_service_role_key}}" },
+              { "key": "Authorization", "value": "Bearer {{supabase_service_role_key}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Prefer", "value": "return=representation" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"is_shared\": true,\n  \"shared_at\": \"2026-02-13T00:00:00Z\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "⚠️ Requires service_role_key. Share or unshare an analysis. Replace `123` with actual analysis ID."
+          }
+        }
+      ]
+    },
+    {
+      "name": "🔑 Stripe — Direct API",
+      "description": "Direct Stripe API calls for debugging.\n\n**These bypass the LLEO backend** — they go directly to Stripe.",
+      "item": [
+        {
+          "name": "GET /v1/customers — List Customers",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/customers?limit=10",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "customers"],
+              "query": [
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "List recent Stripe customers."
+          }
+        },
+        {
+          "name": "GET /v1/customers/search — Find by Email",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/customers/search?query=email:'{{user_email}}'",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "customers", "search"],
+              "query": [
+                { "key": "query", "value": "email:'{{user_email}}'" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "Search for a Stripe customer by email."
+          }
+        },
+        {
+          "name": "GET /v1/subscriptions — List Subscriptions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/subscriptions?limit=10&status=all",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "subscriptions"],
+              "query": [
+                { "key": "limit", "value": "10" },
+                { "key": "status", "value": "all" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "List all subscriptions. Filter by status: active, canceled, past_due, all."
+          }
+        },
+        {
+          "name": "GET /v1/prices — List Prices",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/prices?active=true&limit=10",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "prices"],
+              "query": [
+                { "key": "active", "value": "true" },
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "List active prices. Current Pro price: price_1T04cyG0juUNsGnR3QbsXguf ($1/month)."
+          }
+        },
+        {
+          "name": "GET /v1/webhook_endpoints — List Webhooks",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/webhook_endpoints?limit=10",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "webhook_endpoints"],
+              "query": [
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "List all webhook endpoints. Verify the ndvi6 URL is registered.\n\nExpected URL: https://ndvi6-analysis-api-258557095482.us-central1.run.app/api/stripe/webhook"
+          }
+        },
+        {
+          "name": "GET /v1/events — Recent Events",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "https://api.stripe.com/v1/events?limit=10",
+              "protocol": "https",
+              "host": ["api", "stripe", "com"],
+              "path": ["v1", "events"],
+              "query": [
+                { "key": "limit", "value": "10" }
+              ]
+            },
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{stripe_secret_key}}" }
+            ],
+            "description": "List recent Stripe events. Useful for debugging webhook delivery."
+          }
+        }
+      ]
+    },
+    {
+      "name": "🧪 Sample Flows",
+      "description": "Pre-configured test flows. Run these in order.",
+      "item": [
+        {
+          "name": "Flow 1: Air Quality (Serbia)",
+          "description": "Complete air quality analysis flow with clarification.\n\n1. Start → asks which pollutants\n2. Continue → 'all'\n3. Analyze → triggers analysis\n4. Poll status until completed",
+          "item": [
+            {
+              "name": "1. Start — Air Quality Query",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "var jsonData = pm.response.json();",
+                      "pm.collectionVariables.set('session_id', jsonData.session_id);",
+                      "console.log('Session: ' + jsonData.session_id);",
+                      "console.log('Status: ' + jsonData.status);",
+                      "console.log('Message: ' + jsonData.message);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/start",
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    { "key": "query", "value": "air pollution levels in Holcim cement factory in Beočin, Serbia 2024" },
+                    { "key": "user_id", "value": "{{user_id}}" },
+                    { "key": "user_email", "value": "{{user_email}}" }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "2. Continue — All Pollutants",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "var jsonData = pm.response.json();",
+                      "console.log('Status: ' + jsonData.status);",
+                      "console.log('Ready: ' + jsonData.ready_to_analyze);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/continue",
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    { "key": "session_id", "value": "{{session_id}}" },
+                    { "key": "message", "value": "all pollutants please" }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "3. Analyze — Trigger",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "var jsonData = pm.response.json();",
+                      "pm.collectionVariables.set('analysis_session_id', jsonData.session_id);",
+                      "console.log('Analysis Session: ' + jsonData.session_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/analyze",
+                "body": {
+                  "mode": "urlencoded",
+                  "urlencoded": [
+                    { "key": "session_id", "value": "{{session_id}}" }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "4. Poll Status",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/status/{{analysis_session_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Flow 2: Vegetation (Brazil)",
+          "description": "Direct vegetation analysis — usually doesn't need clarification.",
+          "item": [
+            {
+              "name": "1. Start — Vegetation Query",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "var jsonData = pm.response.json();",
+                      "pm.collectionVariables.set('session_id', jsonData.session_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/start",
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    { "key": "query", "value": "Vegetation change in Fazenda Rio Preto I farm in Mato Grosso, Brazil in 2024" },
+                    { "key": "user_id", "value": "{{user_id}}" },
+                    { "key": "user_email", "value": "{{user_email}}" }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "2. Analyze — Trigger",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "var jsonData = pm.response.json();",
+                      "pm.collectionVariables.set('analysis_session_id', jsonData.session_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/analyze",
+                "body": {
+                  "mode": "urlencoded",
+                  "urlencoded": [
+                    { "key": "session_id", "value": "{{session_id}}" }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "3. Poll Status",
+              "request": {
+                "method": "GET",
+                "url": "{{base_url}}/status/{{analysis_session_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Flow 3: General Question (No Analysis)",
+          "description": "Ask a general question — LLEO answers without running analysis.",
+          "item": [
+            {
+              "name": "1. Start — General Question",
+              "request": {
+                "method": "POST",
+                "url": "{{base_url}}/chat/start",
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    { "key": "query", "value": "What satellite data sources can you analyze?" },
+                    { "key": "user_id", "value": "{{user_id}}" },
+                    { "key": "user_email", "value": "{{user_email}}" }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

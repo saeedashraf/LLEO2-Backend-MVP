@@ -1,0 +1,59 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:${BUILD_ID}', '-t', 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:latest', '.']
+    id: build
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:${BUILD_ID}']
+    id: push-versioned
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:latest']
+    id: push-latest
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'ndvi6-analysis-api'
+      - '--image'
+      - 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:${BUILD_ID}'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '16Gi'
+      - '--cpu'
+      - '4'
+      - '--timeout'
+      - '3600'
+      - '--min-instances'
+      - '1'
+      - '--concurrency'
+      - '80'
+      - '--max-instances'
+      - '25'
+      - '--cpu-throttling'
+      - '--no-cpu-boost'
+      - '--add-cloudsql-instances'
+      - 'gen-lang-client-0709485529:us-central1:ndvi3-postgres-instance'
+      - '--set-secrets'
+      - 'DB_PASSWORD=ndvi3-db-password:latest,EARTH_ENGINE_KEY=earth-engine-key:latest,ADMIN_KEY=ndvi3-admin-key:latest,OPENWEATHER_API_KEY=openweather-api-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,STRIPE_PRO_PRICE_ID=stripe-pro-price-id:latest,RESEND_API_KEY=resend-api-key:latest,GOOGLE_EARTH_ENGINE_CREDENTIALS=google-earth-engine-credentials:latest,GOOGLE_APPLICATION_CREDENTIALS_JSON=google-earth-engine-credentials:latest,GEMINI_API_KEY=gemini-api-key:latest,PLANET_API_KEY=planet-api-key:latest'
+      - '--set-env-vars'
+      - 'GOOGLE_CLOUD_PROJECT=gen-lang-client-0709485529,STORAGE_BUCKET_NAME=ndvi3-analysis-storage-bucket,REGION=us-central1,PYTHONUNBUFFERED=1,DB_USER=ndvi3_user,DB_NAME=ndvi3_analysis,SUPABASE_URL=https://quvbsftdyaxjqlwnjtxv.supabase.co'
+      - '--service-account'
+      - 'ndvi6-service-account@gen-lang-client-0709485529.iam.gserviceaccount.com'
+    id: deploy
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: 'CLOUD_LOGGING_ONLY'
+
+images:
+  - 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:${BUILD_ID}'
+  - 'us-central1-docker.pkg.dev/gen-lang-client-0709485529/ndvi6-docker/ndvi6-analysis-api:latest'
+
+timeout: '1800s'

@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+test/
+tests/
+*_test.py
+
+# Data files (adjust as needed)
+*.csv
+*.json
+!requirements.txt
+!package*.json
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.*
+
+# Large data directories (adjust based on your project)
+data/
+downloads/
+cache/
