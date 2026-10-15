@@ -277,80 +277,134 @@ class AirQualityProcessor(BaseProcessor):
 
         results = {}
         images = {}
-        max_images_per_pollutant = 36
 
         self.log_info(
             f"Processing {len(pollutant_configs)} pollutant(s) from Sentinel-5P "
-            f"({', '.join(pollutant_configs.keys())}) — max {max_images_per_pollutant} images each",
+            f"({', '.join(pollutant_configs.keys())}) — monthly composites over "
+            f"{start_date} .. {end_date}",
             session_id=session_id
         )
+
+        # Number of whole months spanned by the request.
+        ee_start, ee_end = ee.Date(start_date), ee.Date(end_date)
+        n_months = int(ee_end.difference(ee_start, 'month').ceil().getInfo())
+        n_months = max(1, n_months)
 
         for pollutant_name, config in pollutant_configs.items():
             try:
                 self.log_info(f"Processing {pollutant_name}...", session_id=session_id)
 
-                # Get collection
+                band = config['band']
+                scale_factor = config['scale']
+
                 base_collection = (
                     ee.ImageCollection(config['collection'])
                     .filterBounds(region)
                     .filterDate(start_date, end_date)
-                    .select(config['band'])
+                    .select(band)
                 )
 
                 total_size = base_collection.size().getInfo()
 
                 if total_size == 0:
-                    self.log_warning(f"No data found for {pollutant_name}", session_id=session_id)
+                    self.log_warning(f"No images found for {pollutant_name}", session_id=session_id)
                     results[pollutant_name] = {
-                        'value': 0,
+                        'value': None,
                         'unit': config['unit'],
-                        'label': config['label']
+                        'label': config['label'],
+                        'image_count': 0,
                     }
                     continue
 
-                print(f"      Total available: {total_size} images")
-
-                # Limit images if too many
-                if total_size <= max_images_per_pollutant:
-                    collection = base_collection
-                    print(f"      ✅ Using all {total_size} images")
-                else:
-                    collection = base_collection.sort('system:time_start').limit(max_images_per_pollutant)
-                    print(f"      ✅ Using {max_images_per_pollutant} chronologically distributed images (from {total_size})")
-
-                # Calculate mean image for visualization
-                mean_image = collection.mean().clip(region)
+                # Mean over the WHOLE period.
+                #
+                # This previously used .sort('system:time_start').limit(36),
+                # which takes the 36 EARLIEST images — for a 20-month request
+                # that was the first ~3 days only, and for sparsely-retrieved
+                # bands like CH4 every pixel in that window is masked, so the
+                # regional mean came back None and the map tiles were empty.
+                # .mean() is a server-side reduction, so there is no need to
+                # cap the image count.
+                mean_image = base_collection.mean().clip(region)
                 images[pollutant_name] = mean_image
 
-                # Calculate statistics
                 mean_value = mean_image.reduceRegion(
                     reducer=ee.Reducer.mean(),
                     geometry=region,
                     scale=5500,
                     maxPixels=1e9
-                ).get(config['band']).getInfo()
+                ).get(band).getInfo()
 
-                if mean_value:
-                    results[pollutant_name] = {
-                        'value': mean_value * config['scale'],
-                        'unit': config['unit'],
-                        'label': config['label']
-                    }
-                    print(f"      ✅ {pollutant_name}: {mean_value * config['scale']:.2f} {config['unit']}")
+                results[pollutant_name] = {
+                    'value': mean_value * scale_factor if mean_value is not None else None,
+                    'unit': config['unit'],
+                    'label': config['label'],
+                    'image_count': total_size,
+                }
+
+                if mean_value is None:
+                    self.log_warning(
+                        f"{pollutant_name}: {total_size} images matched but every pixel in "
+                        f"the region is masked (no valid retrievals)",
+                        session_id=session_id
+                    )
                 else:
-                    results[pollutant_name] = {
-                        'value': 0,
-                        'unit': config['unit'],
-                        'label': config['label']
-                    }
-                    print(f"      ⚠️  {pollutant_name}: No data available")
+                    print(f"      ✅ {pollutant_name}: {mean_value * scale_factor:.2f} {config['unit']} "
+                          f"(from {total_size} images)")
+
+                # ── Real monthly series, fetched in a single round trip ──
+                try:
+                    def _monthly(i):
+                        m_start = ee_start.advance(ee.Number(i), 'month')
+                        m_end = m_start.advance(1, 'month')
+                        val = (
+                            base_collection
+                            .filterDate(m_start, m_end)
+                            .mean()
+                            .reduceRegion(
+                                reducer=ee.Reducer.mean(),
+                                geometry=region,
+                                scale=5500,
+                                maxPixels=1e9
+                            ).get(band)
+                        )
+                        return ee.Feature(None, {
+                            'label': m_start.format('YYYY-MM'),
+                            'value': val,
+                        })
+
+                    rows = ee.FeatureCollection(
+                        ee.List.sequence(0, n_months - 1).map(_monthly)
+                    ).getInfo()['features']
+
+                    series = [
+                        (r['properties'].get('label'), r['properties'].get('value'))
+                        for r in rows
+                    ]
+                    results[pollutant_name]['monthly'] = [
+                        {'label': lbl, 'value': (v * scale_factor) if v is not None else None}
+                        for lbl, v in series
+                    ]
+                    valid = sum(1 for _, v in series if v is not None)
+                    self.log_info(
+                        f"{pollutant_name}: {valid}/{n_months} months with valid data",
+                        session_id=session_id
+                    )
+                except Exception as series_err:
+                    self.log_warning(
+                        f"{pollutant_name}: monthly series unavailable: {series_err}",
+                        session_id=session_id
+                    )
+                    results[pollutant_name]['monthly'] = []
 
             except Exception as e:
                 self.log_error(f"Error processing {pollutant_name}: {e}", session_id=session_id)
                 results[pollutant_name] = {
-                    'value': 0,
+                    'value': None,
                     'unit': config['unit'],
-                    'label': config['label']
+                    'label': config['label'],
+                    'image_count': 0,
+                    'monthly': [],
                 }
 
         return results, images

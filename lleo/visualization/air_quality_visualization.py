@@ -174,121 +174,172 @@ class AirQualityVisualization:
     def create_charts(self, data: Dict[str, Any], save_path: str = 'air_quality_charts.png') -> None:
         print("📊 Creating air quality charts...")
 
+        def _no_data(ax, title, note='No valid data for this period'):
+            """Honest empty panel. Never invent numbers to fill a chart."""
+            ax.text(0.5, 0.5, note, ha='center', va='center',
+                    fontsize=12, color='#6b7280')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(title, fontsize=12, fontweight='bold')
+
         # Filter to actual pollutant keys present in the data
         pollutants = [k for k in data if k not in ('year_comparison', 'temporal_data')]
-        if not pollutants:
-            pollutants = ['No Data']
-            values = [0.0]
-            units = ['']
-            labels = pollutants
-        else:
-            values = [data[p].get('value', 0) for p in pollutants]
-            units = [data[p].get('unit', '') for p in pollutants]
-            labels = [data[p].get('label', p) for p in pollutants]
 
-        # Colour per pollutant (from POLLUTANT_VIS palette midpoint or defaults)
-        bar_colors = []
-        for p in pollutants:
-            vis = POLLUTANT_VIS.get(p)
-            bar_colors.append(vis['palette'][-1] if vis else '#888888')
+        # value is None when every pixel in the region was masked. That is NOT
+        # the same as a concentration of zero and must not be plotted as one.
+        raw_values = {p: data[p].get('value') for p in pollutants}
+        units = {p: data[p].get('unit', '') for p in pollutants}
+        labels = {p: data[p].get('label', p) for p in pollutants}
+        measured = [p for p in pollutants if raw_values.get(p) is not None]
 
-        # ── Figure layout: 2 × 2 + overall colour-bar strip ──
+        # Distinct categorical colours. POLLUTANT_VIS palettes are sequential
+        # ramps whose last stop is red for several pollutants, which made
+        # NO2 and CO indistinguishable in the pie chart.
+        CHART_COLORS = {
+            'NO2': '#d7342a',
+            'SO2': '#8c564b',
+            'CO':  '#1f77b4',
+            'O3':  '#2ca02c',
+            'CH4': '#e377c2',
+        }
+        _fallback = ['#7f7f7f', '#bcbd22', '#17becf', '#9467bd', '#ff7f0e']
+        bar_colors_all = {}
+        for i, p in enumerate(pollutants):
+            bar_colors_all[p] = CHART_COLORS.get(p, _fallback[i % len(_fallback)])
+
         fig = plt.figure(figsize=(16, 12))
         gs = fig.add_gridspec(3, 2, height_ratios=[5, 5, 1.2], hspace=0.35, wspace=0.30)
-
         ax1 = fig.add_subplot(gs[0, 0])
         ax2 = fig.add_subplot(gs[0, 1])
         ax3 = fig.add_subplot(gs[1, 0])
         ax4 = fig.add_subplot(gs[1, 1])
-        ax_cb = fig.add_subplot(gs[2, :])   # colour-bar strip at bottom
+        ax_cb = fig.add_subplot(gs[2, :])
 
         fig.suptitle(
-            f'Air Quality Analysis — {self.location_name}\n'
-            f'{self.start_date[:4]}–{self.end_date[:4]}  •  Sentinel-5P TROPOMI',
+            'Air Quality Analysis \u2014 {}\n{}\u2013{}  \u2022  Sentinel-5P TROPOMI'.format(
+                self.location_name, self.start_date[:4], self.end_date[:4]),
             fontsize=16, fontweight='bold', y=0.98,
         )
 
-        # ── Chart 1: Bar chart with units ─────────────────────────────────
-        bars = ax1.bar(labels, values, color=bar_colors, edgecolor='white', linewidth=0.5)
-        ax1.set_ylabel('Concentration', fontweight='bold')
-        ax1.set_title('Average Pollutant Concentrations', fontsize=12, fontweight='bold')
-        ax1.grid(True, alpha=0.3, axis='y')
-        ax1.tick_params(axis='x', rotation=30)
+        # Chart 1: average concentration per pollutant
+        if measured:
+            vals = [raw_values[p] for p in measured]
+            ax1.bar(range(len(measured)), vals,
+                    color=[bar_colors_all[p] for p in measured],
+                    edgecolor='white', linewidth=0.5, width=0.6)
+            ax1.set_ylabel('Concentration', fontweight='bold')
+            ax1.set_title('Average Pollutant Concentrations', fontsize=12, fontweight='bold')
+            ax1.grid(True, alpha=0.3, axis='y')
+            # Short tick labels: the long descriptive label used to be rotated
+            # 30 degrees and overlapped the title of the panel below.
+            ax1.set_xticks(range(len(measured)))
+            ax1.set_xticklabels(measured, fontsize=10, fontweight='bold')
+            ax1.set_xlim(-0.6, len(measured) - 0.4)
+            # Headroom so the value annotation is not clipped by the top spine.
+            ax1.set_ylim(0, max(vals) * 1.18)
+            for i, p in enumerate(measured):
+                ax1.text(i, raw_values[p],
+                         '{:.4g} {}'.format(raw_values[p], units[p]),
+                         ha='center', va='bottom', fontsize=9, fontweight='bold')
+        else:
+            _no_data(ax1, 'Average Pollutant Concentrations',
+                     'No valid retrievals in this\nregion and time period')
 
-        for i, (v, u) in enumerate(zip(values, units)):
-            if v > 0:
-                ax1.text(i, v, f'{v:.2e}\n{u}', ha='center', va='bottom',
-                         fontsize=7, fontweight='bold')
-
-        # ── Chart 2: Pie chart with legend ────────────────────────────────
-        if sum(values) > 0:
-            wedges, texts, autotexts = ax2.pie(
-                values, labels=None, autopct='%1.1f%%',
-                colors=bar_colors, startangle=140,
+        # Chart 2: relative distribution (needs 2+ measured pollutants)
+        if len(measured) >= 2:
+            vals = [raw_values[p] for p in measured]
+            wedges, _, _ = ax2.pie(
+                vals, labels=None, autopct='%1.1f%%',
+                colors=[bar_colors_all[p] for p in measured], startangle=140,
             )
             ax2.legend(
                 wedges,
-                [f"{l} ({u})" for l, u in zip(labels, units)],
-                title="Pollutants",
-                loc='center left',
-                bbox_to_anchor=(1.0, 0.5),
-                fontsize=8,
+                ['{} ({})'.format(labels[p], units[p]) for p in measured],
+                title='Pollutants', loc='center left',
+                bbox_to_anchor=(1.0, 0.5), fontsize=8,
             )
             ax2.set_title('Relative Pollutant Distribution', fontsize=12, fontweight='bold')
         else:
-            ax2.text(0.5, 0.5, 'No Data Available', ha='center', va='center', fontsize=14)
-            ax2.set_title('Relative Pollutant Distribution', fontsize=12, fontweight='bold')
+            _no_data(ax2, 'Relative Pollutant Distribution',
+                     'Needs at least two measured\npollutants to compare')
 
-        # ── Chart 3: Year comparison or AQI distribution ──────────────────
-        if self.start_date[:4] != self.end_date[:4]:
-            years = [self.start_date[:4], self.end_date[:4]]
-            y1_vals = [v * (0.9 + np.random.random() * 0.2) for v in values]
-            y2_vals = [v * (0.9 + np.random.random() * 0.2) for v in values]
-            x = np.arange(len(pollutants))
-            w = 0.35
-            b1 = ax3.bar(x - w / 2, y1_vals, w, label=years[0], alpha=0.85)
-            b2 = ax3.bar(x + w / 2, y2_vals, w, label=years[1], alpha=0.85)
-            ax3.set_xlabel('Pollutants', fontweight='bold')
-            ax3.set_ylabel('Concentration', fontweight='bold')
-            ax3.set_title('Year-over-Year Comparison', fontsize=12, fontweight='bold')
-            ax3.set_xticks(x)
-            ax3.set_xticklabels(labels, rotation=30)
-            ax3.legend(title='Year')
-            ax3.grid(True, alpha=0.3, axis='y')
+        # Real monthly series produced by the processor:
+        #   [{'label': 'YYYY-MM', 'value': float or None}, ...]
+        series = {}
+        for p in pollutants:
+            series[p] = [m for m in (data[p].get('monthly') or [])
+                         if m.get('value') is not None]
+        primary = max(measured, key=lambda p: len(series.get(p, [])), default=None)
+
+        # Chart 3: year-over-year, computed from the monthly series.
+        # This previously multiplied the single mean by random noise to
+        # fabricate two years of "comparison" data.
+        yearly = {}
+        if primary:
+            for m in series[primary]:
+                yearly.setdefault(str(m['label'])[:4], []).append(m['value'])
+
+        if len(yearly) >= 2:
+            years = sorted(yearly)
+            means = [sum(yearly[y]) / len(yearly[y]) for y in years]
+            colour = bar_colors_all.get(primary, '#888888')
+            ax3.plot(range(len(years)), means, 'o', markersize=16,
+                     color=colour, markeredgecolor='white', markeredgewidth=2)
+            for i, y in enumerate(years):
+                ax3.text(i, means[i],
+                         '  {:.4g}  ({} mo)'.format(means[i], len(yearly[y])),
+                         ha='left', va='center', fontsize=9, fontweight='bold')
+            ax3.set_xticks(range(len(years)))
+            ax3.set_xticklabels(years, fontsize=11, fontweight='bold')
+            ax3.set_xlim(-0.5, len(years) - 0.2)
+            # Zoom to the data. A bar chart truncated this way would overstate
+            # the difference; markers on a zoomed axis do not.
+            lo, hi = min(means), max(means)
+            pad = max((hi - lo) * 0.8, abs(hi) * 0.002) or 1.0
+            ax3.set_ylim(lo - pad, hi + pad)
+            ax3.set_xlabel('Year', fontweight='bold')
+            ax3.set_ylabel('{} ({})'.format(labels[primary], units[primary]),
+                           fontweight='bold')
+            ax3.set_title('Year-over-Year Comparison (annual mean)',
+                          fontsize=12, fontweight='bold')
+            ax3.grid(True, alpha=0.3)
         else:
-            aqi_levels = ['Good', 'Moderate', 'Unhealthy\nSensitive', 'Unhealthy', 'Very\nUnhealthy']
-            aqi_colors = ['#00e400', '#ffff00', '#ff7e00', '#ff0000', '#99004c']
-            aqi_values = [20, 30, 25, 15, 10]
-            ax3.bar(aqi_levels, aqi_values, color=aqi_colors, edgecolor='white')
-            ax3.set_ylabel('Days (%)', fontweight='bold')
-            ax3.set_title('Air Quality Index Distribution', fontsize=12, fontweight='bold')
-            ax3.grid(True, alpha=0.3, axis='y')
-            # Add AQI legend
-            from matplotlib.patches import Patch
-            aqi_legend = [Patch(facecolor=c, label=l) for c, l in zip(aqi_colors, ['0–50 Good', '51–100 Moderate', '101–150 Unhealthy (Sensitive)', '151–200 Unhealthy', '201+ Very Unhealthy'])]
-            ax3.legend(handles=aqi_legend, fontsize=7, title='AQI Scale', loc='upper right')
+            _no_data(ax3, 'Year-over-Year Comparison',
+                     'Needs valid data in two or\nmore calendar years')
 
-        # ── Chart 4: Temporal trend ───────────────────────────────────────
-        if 'temporal_data' in data:
-            times = data['temporal_data']['times']
-            tv = data['temporal_data']['values']
-            ax4.plot(times, tv, 'b-', linewidth=2, marker='o')
-            ax4.fill_between(times, tv, alpha=0.3)
+        # Chart 4: temporal trend from the real monthly series.
+        # This previously drew a sine wave plus Gaussian noise around an
+        # arbitrary base of 50.0 whenever no series was supplied.
+        if primary and len(series[primary]) >= 2:
+            pts = series[primary]
+            xs = list(range(len(pts)))
+            ys = [m['value'] for m in pts]
+            lo, hi = min(ys), max(ys)
+            pad = max((hi - lo) * 0.25, abs(hi) * 0.002) or 1.0
+            y_floor = lo - pad
+            ax4.plot(xs, ys, 'b-', linewidth=2, marker='o', markersize=4)
+            # Fill down to the axis floor, not to zero: filling from zero made
+            # a series spanning 1850-1950 ppb look like a flat block.
+            ax4.fill_between(xs, ys, y_floor, alpha=0.25)
+            ax4.set_ylim(y_floor, hi + pad)
+            step = max(1, len(pts) // 8)
+            ax4.set_xticks(xs[::step])
+            ax4.set_xticklabels([m['label'] for m in pts][::step],
+                                rotation=45, fontsize=8)
+            ax4.set_xlabel('Month', fontweight='bold')
+            ax4.set_ylabel('{} ({})'.format(labels[primary], units[primary]),
+                           fontweight='bold')
+            ax4.set_title(
+                'Temporal Trend \u2014 {} ({} months with data)'.format(
+                    labels[primary], len(pts)),
+                fontsize=12, fontweight='bold',
+            )
+            ax4.grid(True, alpha=0.3)
         else:
-            num_months = max(1, (int(self.end_date[:4]) - int(self.start_date[:4]) + 1) * 12)
-            months = np.arange(num_months)
-            base = max(values) if values and max(values) > 0 else 50.0
-            tv = base * (1 + 0.1 * np.sin(months / 6)) + np.random.normal(0, base * 0.05, num_months)
-            ax4.plot(months, tv, 'b-', linewidth=2, marker='o', markersize=3)
-            ax4.fill_between(months, tv, alpha=0.3)
-
-        ax4.set_xlabel('Time Period (months)', fontweight='bold')
-        ax4.set_ylabel('Primary Pollutant Conc.', fontweight='bold')
-        ax4.set_title(
-            f'Temporal Trend ({self.start_date[:4]}–{self.end_date[:4]})',
-            fontsize=12, fontweight='bold',
-        )
-        ax4.grid(True, alpha=0.3)
+            _no_data(ax4,
+                     'Temporal Trend ({}\u2013{})'.format(
+                         self.start_date[:4], self.end_date[:4]),
+                     'Fewer than two months with\nvalid retrievals')
 
         # ── Bottom strip: colour-scale bars for every pollutant ───────────
         ax_cb.set_axis_off()
