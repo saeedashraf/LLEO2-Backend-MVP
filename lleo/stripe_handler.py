@@ -288,6 +288,15 @@ class StripeHandler:
         Raises RuntimeError / ValueError with a human-readable message on failure
         so the billing router can forward it to the frontend.
         """
+        # ── Master switch ────────────────────────────────────────────────
+        # New subscriptions are off unless SUBSCRIPTIONS_ENABLED is explicitly
+        # "true". Default-off so the feature cannot be re-opened by accident,
+        # and enforced here rather than only in the UI so a direct API call
+        # cannot bypass it.
+        if os.getenv('SUBSCRIPTIONS_ENABLED', 'false').strip().lower() != 'true':
+            print(f"🚫 create_checkout_session blocked: subscriptions are disabled ({user_email})")
+            raise ValueError("New subscriptions are currently unavailable.")
+
         # ── Pre-flight: make sure required env vars are present ──────────
         if not stripe.api_key:
             print("❌ create_checkout_session: STRIPE_SECRET_KEY is not set")
@@ -377,161 +386,143 @@ class StripeHandler:
 
     @staticmethod
     def cancel_subscription(user_email: str) -> Dict[str, Any]:
-        """Cancel a user's subscription — gracefully at period end if active, immediately if past_due"""
-        try:
-            # Get customer by email
-            customers = stripe.Customer.list(email=user_email, limit=1)
+        """Cancel every billable subscription for a user.
 
+        Active/trialing subscriptions are cancelled at period end so the user
+        keeps what they paid for. past_due/unpaid/incomplete ones are cancelled
+        immediately, since there is no paid period left to preserve.
+        """
+        try:
+            customers = stripe.Customer.list(email=user_email, limit=1)
             if not customers.data:
-                print(f"❌ Cancel: No Stripe customer found for email: {user_email}")
+                print(f"\u274c Cancel: No Stripe customer found for email: {user_email}")
                 return {"success": False, "error": "Customer not found"}
 
             customer = customers.data[0]
-            print(f"📧 Cancel: Found Stripe customer {customer.id} for {user_email}")
+            print(f"\U0001f4e7 Cancel: Found Stripe customer {customer.id} for {user_email}")
 
-            # Search for cancelable subscriptions (any non-canceled status)
-            subscription = None
-            found_status = None
-            for status in ['active', 'trialing', 'past_due', 'unpaid', 'incomplete']:
-                subs = stripe.Subscription.list(
-                    customer=customer.id,
-                    status=status,
-                    limit=1
-                )
-                if subs.data:
-                    subscription = subs.data[0]
-                    found_status = status
-                    print(f"📋 Cancel: Found subscription {subscription.id} with status={status}")
-                    break
+            # Collect ALL billable subscriptions, not just the first one.
+            # A customer can hold more than one (duplicate checkout races),
+            # and cancelling only one leaves the others charging.
+            billable = []
+            seen = set()
+            for sub in stripe.Subscription.list(customer=customer.id, status='all', limit=100).auto_paging_iter():
+                if sub.status in ('canceled', 'incomplete_expired'):
+                    continue
+                if sub.id in seen:
+                    continue
+                seen.add(sub.id)
+                billable.append(sub)
 
-            if not subscription:
-                # Log all subs for debugging
-                all_subs = stripe.Subscription.list(customer=customer.id, limit=5)
-                statuses = [f"{s.id}({s.status})" for s in all_subs.data]
-                print(f"❌ Cancel: No cancelable subscription. All subs: {statuses or 'none'}")
+            if not billable:
+                print(f"\u274c Cancel: No billable subscription for {user_email}")
                 return {"success": False, "error": "No active subscription found"}
 
-            # Helper: get period end date
-            period_end_ts = getattr(subscription, 'current_period_end', None)
-            period_end_date = None
-            period_expired = False
-            if period_end_ts:
-                period_end_dt = datetime.fromtimestamp(period_end_ts)
-                period_end_date = period_end_dt.strftime('%B %d, %Y')
-                period_expired = period_end_dt < datetime.now()
+            print(f"\U0001f4cb Cancel: {len(billable)} billable subscription(s) for {user_email}: "
+                  + ", ".join(f"{s.id}({s.status})" for s in billable))
 
-            # Already set to cancel?
-            if getattr(subscription, 'cancel_at_period_end', False):
-                if period_expired:
-                    # Period already ended — cancel immediately in Stripe and update Supabase
-                    try:
-                        stripe.Subscription.cancel(subscription.id)
-                        user = supabase_client.get_user_by_email(user_email)
-                        if user:
-                            supabase_client.update_subscription(
-                                user_id=user['id'],
-                                status='canceled',
-                                plan_type='free'
-                            )
-                        print(f"✅ Expired subscription {subscription.id} fully canceled for {user_email}")
-                    except Exception as cleanup_err:
-                        print(f"⚠️ Cleanup error: {cleanup_err}")
+            cancelled_now = []
+            cancelling_at_end = []
+            errors = []
+            latest_period_end = None
 
-                    # Send cancel confirmation email
-                    try:
-                        u = supabase_client.get_user_by_email(user_email)
-                        cr = supabase_client.get_user_credits(u['id']) if u else None
-                        remaining = cr.get('credits', 0) if cr else 0
-                        supabase_client.send_cancel_email(user_email, period_end_date, remaining)
-                    except Exception:
-                        pass
-
-                    return {
-                        "success": True,
-                        "message": "Subscription has been canceled. Your remaining credits are still available for use.",
-                        "cancel_date": period_end_date,
-                        "period_expired": True,
-                        "subscription_id": subscription.id
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "message": f"Subscription is set to cancel on {period_end_date}. You'll keep Pro access and your remaining credits until then. No further charges will be made.",
-                        "cancel_date": period_end_date,
-                        "period_expired": False,
-                        "subscription_id": subscription.id
-                    }
-
-            # For past_due/unpaid/incomplete: cancel immediately (no active period to preserve)
-            if found_status in ('past_due', 'unpaid', 'incomplete'):
-                stripe.Subscription.cancel(subscription.id)
-                print(f"✅ Subscription {subscription.id} canceled immediately (was {found_status}) for {user_email}")
-
-                # Also update Supabase to reflect cancellation
+            for sub in billable:
                 try:
-                    user = supabase_client.get_user_by_email(user_email)
-                    if user:
-                        supabase_client.update_subscription(
-                            user_id=user['id'],
-                            status='canceled',
-                            plan_type='free'
-                        )
-                except Exception as db_err:
-                    print(f"⚠️ Could not update Supabase after cancel: {db_err}")
+                    period_end_ts = StripeHandler._subscription_period_end(sub)
+                    if period_end_ts and (latest_period_end is None or period_end_ts > latest_period_end):
+                        latest_period_end = period_end_ts
+                    period_expired = bool(period_end_ts) and \
+                        datetime.fromtimestamp(period_end_ts) < datetime.now()
 
-                # Send cancel confirmation email
-                try:
-                    u = supabase_client.get_user_by_email(user_email)
-                    cr = supabase_client.get_user_credits(u['id']) if u else None
-                    remaining = cr.get('credits', 0) if cr else 0
-                    supabase_client.send_cancel_email(user_email, period_end_date, remaining)
-                except Exception:
-                    pass
+                    immediate = sub.status in ('past_due', 'unpaid', 'incomplete') or period_expired
 
-                return {
-                    "success": True,
-                    "message": "Subscription has been canceled. Your remaining credits are still available for use.",
-                    "cancel_date": period_end_date,
-                    "period_expired": True,
-                    "subscription_id": subscription.id
-                }
+                    if immediate:
+                        stripe.Subscription.cancel(sub.id)
+                        cancelled_now.append(sub.id)
+                        print(f"\u2705 {sub.id} cancelled immediately (was {sub.status})")
+                    elif getattr(sub, 'cancel_at_period_end', False):
+                        cancelling_at_end.append(sub.id)
+                        print(f"\u2139\ufe0f  {sub.id} already set to cancel at period end")
+                    else:
+                        stripe.Subscription.modify(sub.id, cancel_at_period_end=True)
+                        cancelling_at_end.append(sub.id)
+                        print(f"\u2705 {sub.id} set to cancel at period end")
+                except Exception as sub_err:
+                    errors.append(f"{sub.id}: {sub_err}")
+                    print(f"\u274c Failed to cancel {sub.id}: {sub_err}")
 
-            # For active/trialing: cancel at end of current billing period
-            updated_sub = stripe.Subscription.modify(
-                subscription.id,
-                cancel_at_period_end=True
-            )
+            if errors and not (cancelled_now or cancelling_at_end):
+                return {"success": False, "error": "; ".join(errors)}
 
-            period_end_ts = getattr(updated_sub, 'current_period_end', None)
-            if period_end_ts:
-                cancel_date = datetime.fromtimestamp(period_end_ts).strftime('%B %d, %Y')
-                msg = f"Subscription will be canceled on {cancel_date}. You'll keep Pro access and your remaining credits until then. No further charges will be made."
-            else:
-                cancel_date = None
-                msg = "Subscription has been set to cancel at the end of the billing period. Your credits remain available."
+            cancel_date = None
+            if latest_period_end:
+                cancel_date = datetime.fromtimestamp(latest_period_end).strftime('%B %d, %Y')
 
-            print(f"✅ Subscription {subscription.id} set to cancel at period end for {user_email}")
-
-            # Send cancel confirmation email
+            # Reflect the change in Supabase.
+            remaining = 0
             try:
-                u = supabase_client.get_user_by_email(user_email)
-                cr = supabase_client.get_user_credits(u['id']) if u else None
-                remaining = cr.get('credits', 0) if cr else 0
+                user = supabase_client.get_user_by_email(user_email)
+                if user:
+                    if not cancelling_at_end:
+                        supabase_client.update_subscription(
+                            user_id=user['id'], status='canceled', plan_type='free')
+                    cr = supabase_client.get_user_credits(user['id'])
+                    remaining = cr.get('credits', 0) if cr else 0
+            except Exception as db_err:
+                print(f"\u26a0\ufe0f Could not update Supabase after cancel: {db_err}")
+
+            try:
                 supabase_client.send_cancel_email(user_email, cancel_date, remaining)
             except Exception:
                 pass
+
+            total = len(cancelled_now) + len(cancelling_at_end)
+            plural = "subscriptions" if total > 1 else "subscription"
+            if cancelling_at_end and cancel_date:
+                msg = (f"{total} {plural} will be canceled on {cancel_date}. "
+                       f"You keep Pro access and your remaining credits until then. "
+                       f"No further charges will be made.")
+            elif cancelling_at_end:
+                msg = (f"{total} {plural} set to cancel at the end of the billing period. "
+                       f"Your credits remain available.")
+            else:
+                msg = (f"{total} {plural} canceled. "
+                       f"Your remaining credits are still available for use.")
 
             return {
                 "success": True,
                 "message": msg,
                 "cancel_date": cancel_date,
-                "period_expired": False,
-                "subscription_id": subscription.id
+                "period_expired": not cancelling_at_end,
+                "canceled_immediately": cancelled_now,
+                "canceling_at_period_end": cancelling_at_end,
+                "errors": errors,
+                "subscription_id": (cancelled_now + cancelling_at_end)[0],
             }
 
         except Exception as e:
-            print(f"❌ Error canceling subscription: {e}")
+            print(f"\u274c Error canceling subscription: {e}")
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _subscription_period_end(subscription) -> Optional[int]:
+        """Current period end, as a unix timestamp.
+
+        Stripe API 2026-04-22 moved current_period_end off the Subscription
+        and onto each subscription item, so the item is checked first and the
+        top-level field kept only as a fallback for older API versions.
+        """
+        try:
+            items = getattr(subscription, 'items', None)
+            data = getattr(items, 'data', None) if items is not None else None
+            if data:
+                ts = getattr(data[0], 'current_period_end', None)
+                if ts:
+                    return ts
+        except Exception:
+            pass
+        return getattr(subscription, 'current_period_end', None)
+
 
     @staticmethod
     def reactivate_subscription(user_email: str) -> Dict[str, Any]:

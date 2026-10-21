@@ -97,16 +97,24 @@ def create_database_engine(config=None, get_secret_func=None):
         os.getenv('CLOUD_RUN_SERVICE')
     )
 
-    # Build database URL
+    # Build database URL.
+    #
+    # The driver is named explicitly. A bare "postgresql://" resolves to
+    # whatever DBAPI the installed SQLAlchemy defaults to, and SQLAlchemy 2.1
+    # changed that default from psycopg2 to psycopg (v3). Because
+    # requirements.txt is unpinned, the 2026-10-15 build picked up
+    # SQLAlchemy 2.1.4, could not import psycopg, and silently fell back to
+    # SQLite — so analyses were being written to an ephemeral file in the
+    # container instead of Cloud SQL.
     if is_cloud and project_id:
         # Cloud SQL with Unix socket
         cloud_sql_connection = f"{project_id}:us-central1:ndvi3-postgres-instance"
-        database_url = f"postgresql://{db_user}:{db_password}@/{db_name}?host=/cloudsql/{cloud_sql_connection}"
+        database_url = f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}?host=/cloudsql/{cloud_sql_connection}"
         print(f"☁️  Using Cloud SQL: {cloud_sql_connection}")
     else:
         # Local PostgreSQL
         db_host = os.getenv('DB_HOST', 'localhost')
-        database_url = f"postgresql://{db_user}:{db_password}@{db_host}:5432/{db_name}"
+        database_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:5432/{db_name}"
         print(f"🏠 Using local PostgreSQL: {db_host}")
 
     # Try PostgreSQL connection
