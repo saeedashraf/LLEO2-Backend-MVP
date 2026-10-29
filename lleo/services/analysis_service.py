@@ -19,6 +19,7 @@ from ..processors import get_processor
 from ..database.models import AnalysisRecord, get_db
 from ..utils.thumbnail import create_satellite_thumbnail
 from . import credits_service
+from . import agent_service
 
 ANALYSIS_CREDIT_COST = int(os.getenv("LLEO_ANALYSIS_CREDIT_COST", "1"))
 
@@ -156,7 +157,10 @@ def _process_analysis_sync(
         sessions[sid]["progress"] = 10
         sessions[sid]["message"] = "Processing data…"
 
-        result: AnalysisResult = _run_processor_sync(processor, request)
+        if agent_service.AGENT_LOOP_ENABLED:
+            result, request = _run_with_agent(processor, request, sessions)
+        else:
+            result = _run_processor_sync(processor, request)
 
         # The processor is finished, but the artefacts are not yet servable:
         # /results/{sid}/* reads from the Postgres record, which is written
@@ -215,13 +219,72 @@ def _process_analysis_sync(
     except Exception as exc:
         import traceback
         traceback.print_exc()
+        outcome = getattr(exc, "agent_outcome", None)
+        msg = f"Error: {exc}"
+        if outcome is not None and outcome.user_message:
+            msg = f"{outcome.user_message} (last error: {exc})"
         sessions[sid].update({
             "status": "failed",
             "progress": 0,
-            "message": f"Error: {exc}",
+            "message": msg,
             "error": str(exc),
             "failed_at": datetime.now().isoformat(),
         })
+        if outcome is not None:
+            sessions[sid]["agent"] = outcome.trace()
+            _save_agent_message(
+                request,
+                f"I tried {len(outcome.attempts)} different settings but couldn't "
+                f"complete the {request.analysis_type.replace('_', ' ')} analysis. "
+                f"{outcome.user_message}".strip(),
+            )
+
+
+# ── Agent loop glue ──────────────────────────────────────────────────────────
+
+def _run_with_agent(processor, request: AnalysisRequest, sessions: dict):
+    """plan → act → observe → re-plan around the processor (the tool).
+
+    Returns ``(result, effective_request)``.  Every retry is announced in the
+    session message (polled by the frontend) and on the conversation
+    timeline so the user can see what the agent changed and why.
+    """
+    sid = request.session_id
+
+    def on_step(n: int, msg: str) -> None:
+        sessions[sid]["message"] = f"Attempt {n}: {msg}"[:200]
+        sessions[sid]["progress"] = min(80, 10 + 25 * (n - 1))
+
+    outcome = agent_service.run_agent(
+        processor, request, _run_processor_sync, on_step=on_step,
+    )
+    sessions[sid]["agent"] = outcome.trace()
+
+    if len(outcome.attempts) > 1:
+        # Tell the user, in plain words, what was corrected.
+        notes = [
+            a.decision.user_message
+            for a in outcome.attempts
+            if a.decision and a.decision.action == "retry" and a.decision.user_message
+        ]
+        if notes:
+            _save_agent_message(
+                request,
+                "I adjusted the analysis automatically: " + " ".join(notes),
+            )
+    return outcome.result, outcome.request
+
+
+def _save_agent_message(request: AnalysisRequest, text: str) -> None:
+    try:
+        conv_sid = getattr(request, "conversation_session_id", None)
+        if not conv_sid or not text:
+            return
+        from .conversation_service import save_message
+        save_message(conv_sid, request.user_id, "assistant", text,
+                     metadata={"kind": "agent_step"})
+    except Exception as exc:
+        print(f"⚠️  Could not save agent message: {exc}")
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────

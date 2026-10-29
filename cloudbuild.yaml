@@ -43,7 +43,7 @@ steps:
       - '--set-secrets'
       - 'DB_PASSWORD=ndvi3-db-password:latest,EARTH_ENGINE_KEY=earth-engine-key:latest,ADMIN_KEY=ndvi3-admin-key:latest,OPENWEATHER_API_KEY=openweather-api-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest,SUPABASE_SERVICE_ROLE_KEY=supabase-service-role-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,STRIPE_PRO_PRICE_ID=stripe-pro-price-id:latest,RESEND_API_KEY=resend-api-key:latest,GOOGLE_EARTH_ENGINE_CREDENTIALS=google-earth-engine-credentials:latest,GOOGLE_APPLICATION_CREDENTIALS_JSON=google-earth-engine-credentials:latest,GEMINI_API_KEY=gemini-api-key:latest,PLANET_API_KEY=planet-api-key:latest'
       - '--set-env-vars'
-      - 'GOOGLE_CLOUD_PROJECT=gen-lang-client-0709485529,STORAGE_BUCKET_NAME=ndvi3-analysis-storage-bucket,REGION=us-central1,PYTHONUNBUFFERED=1,DB_USER=ndvi3_user,DB_NAME=ndvi3_analysis,SUPABASE_URL=https://quvbsftdyaxjqlwnjtxv.supabase.co'
+      - 'GOOGLE_CLOUD_PROJECT=gen-lang-client-0709485529,STORAGE_BUCKET_NAME=ndvi3-analysis-storage-bucket,REGION=us-central1,PYTHONUNBUFFERED=1,DB_USER=ndvi3_user,DB_NAME=ndvi3_analysis,SUPABASE_URL=https://quvbsftdyaxjqlwnjtxv.supabase.co,LLEO_AGENT_LOOP=1,LLEO_AGENT_MAX_ATTEMPTS=3'
       - '--service-account'
       - 'ndvi6-service-account@gen-lang-client-0709485529.iam.gserviceaccount.com'
     id: deploy
