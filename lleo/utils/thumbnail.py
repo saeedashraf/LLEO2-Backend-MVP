@@ -10,6 +10,31 @@ import io
 from PIL import Image, ImageDraw, ImageFont
 
 
+def _extract_bounds(location: dict):
+    """Return (lat_min, lat_max, lng_min, lng_max) from any location shape we store."""
+    b = location.get("bounds")
+    if isinstance(b, dict) and all(k in b for k in ("lat_min", "lat_max", "lng_min", "lng_max")):
+        return float(b["lat_min"]), float(b["lat_max"]), float(b["lng_min"]), float(b["lng_max"])
+    lat, lng = location.get("latitude"), location.get("longitude")
+    if isinstance(lat, dict) and isinstance(lng, dict) and "min" in lat and "min" in lng:
+        return float(lat["min"]), float(lat["max"]), float(lng["min"]), float(lng["max"])
+    return None
+
+
+def _zoom_for_bounds(lat_min, lat_max, lng_min, lng_max, width, height, max_zoom=15, min_zoom=3) -> int:
+    """Largest Web-Mercator zoom at which the bbox fits in width x height px."""
+    def _merc_y(lat):
+        lat = max(-85.05, min(85.05, lat))
+        return (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0
+    dx = max(abs(lng_max - lng_min) / 360.0, 1e-9)
+    dy = max(abs(_merc_y(lat_max) - _merc_y(lat_min)), 1e-9)
+    for z in range(max_zoom, min_zoom - 1, -1):
+        world = 256 * (2 ** z)
+        if dx * world <= width * 0.85 and dy * world <= height * 0.85:
+            return z
+    return min_zoom
+
+
 def create_satellite_thumbnail(
     location: dict,
     analysis_type: str,
@@ -41,22 +66,33 @@ def create_satellite_thumbnail(
 
         location_name = location.get('name', 'Unknown Location')
 
-        zoom = 13
         tile_size = 256
         image_width = 400
         image_height = 300
 
-        def deg2num(lat_deg, lon_deg, zoom):
-            """Convert lat/lon to tile coordinates"""
-            lat_rad = math.radians(lat_deg)
-            n = 2.0 ** zoom
-            x_tile = int((lon_deg + 180.0) / 360.0 * n)
-            y_tile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-            return (x_tile, y_tile)
+        # Fit the analysed region (bbox) into the image instead of a fixed
+        # zoom around the centre point, and centre on the bbox itself.
+        bounds = _extract_bounds(location)
+        if bounds:
+            lat_min, lat_max, lng_min, lng_max = bounds
+            lat_center = (lat_min + lat_max) / 2.0
+            lon_center = (lng_min + lng_max) / 2.0
+            zoom = _zoom_for_bounds(lat_min, lat_max, lng_min, lng_max, image_width, image_height)
+        else:
+            zoom = 13
 
-        center_x_tile, center_y_tile = deg2num(lat_center, lon_center, zoom)
-        tiles_x = math.ceil(image_width / tile_size) + 1
-        tiles_y = math.ceil(image_height / tile_size) + 1
+        def _world_px(lat_deg, lon_deg, z):
+            """Lat/lon → absolute Web-Mercator pixel coordinates at zoom z."""
+            lat_deg = max(-85.05, min(85.05, lat_deg))
+            n = 256.0 * (2 ** z)
+            x = (lon_deg + 180.0) / 360.0 * n
+            y = (1.0 - math.asinh(math.tan(math.radians(lat_deg))) / math.pi) / 2.0 * n
+            return x, y
+
+        cx, cy = _world_px(lat_center, lon_center, zoom)
+        center_x_tile, center_y_tile = int(cx // tile_size), int(cy // tile_size)
+        tiles_x = math.ceil(image_width / tile_size) + 2
+        tiles_y = math.ceil(image_height / tile_size) + 2
 
         composite_width = tiles_x * tile_size
         composite_height = tiles_y * tile_size
@@ -65,7 +101,7 @@ def create_satellite_thumbnail(
         start_x = center_x_tile - tiles_x // 2
         start_y = center_y_tile - tiles_y // 2
 
-        print(f"📍 Creating satellite thumbnail for {location_name}")
+        print(f"📍 Creating satellite thumbnail for {location_name} (zoom {zoom})")
 
         # Fetch map tiles
         for i in range(tiles_x):
@@ -86,14 +122,12 @@ def create_satellite_thumbnail(
                     print(f"⚠️  Failed to get tile {tile_x},{tile_y}: {e}")
                     continue
 
-        # Crop to desired size
-        center_pixel_x = composite_width // 2
-        center_pixel_y = composite_height // 2
+        # Crop so the exact centre point sits in the middle of the image
+        center_pixel_x = int(cx - start_x * tile_size)
+        center_pixel_y = int(cy - start_y * tile_size)
 
         crop_left = center_pixel_x - image_width // 2
         crop_top = center_pixel_y - image_height // 2
-        crop_right = crop_left + image_width
-        crop_bottom = crop_top + image_height
 
         crop_left = max(0, min(crop_left, composite_width - image_width))
         crop_top = max(0, min(crop_top, composite_height - image_height))
@@ -102,8 +136,19 @@ def create_satellite_thumbnail(
 
         final_img = composite_img.crop((crop_left, crop_top, crop_right, crop_bottom))
 
-        # Draw location pin
         draw = ImageDraw.Draw(final_img)
+
+        # Outline of the analysed region
+        if bounds:
+            x0, y0 = _world_px(lat_max, lng_min, zoom)
+            x1, y1 = _world_px(lat_min, lng_max, zoom)
+            ox, oy = start_x * tile_size + crop_left, start_y * tile_size + crop_top
+            rx0, ry0, rx1, ry1 = x0 - ox, y0 - oy, x1 - ox, y1 - oy
+            if rx1 - rx0 > 12 and ry1 - ry0 > 12:
+                draw.rectangle([rx0 + 1, ry0 + 1, rx1 + 1, ry1 + 1], outline=(0, 0, 0), width=3)
+                draw.rectangle([rx0, ry0, rx1, ry1], outline=(255, 220, 60), width=2)
+
+        # Draw location pin
         pin_x = image_width // 2
         pin_y = image_height // 2
         pin_radius = 8

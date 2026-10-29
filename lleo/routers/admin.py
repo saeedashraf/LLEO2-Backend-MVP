@@ -153,6 +153,105 @@ async def prune_expired_artifacts(
     return await run_in_threadpool(_prune_expired_sync, dry_run, only_shared, max(1, min(limit, 5000)))
 
 
+def _location_for_thumbnail(rec: AnalysisRecord) -> Optional[dict]:
+    """Rebuild a thumbnail-friendly location dict from what the row stores."""
+    coords = rec.coordinates if isinstance(rec.coordinates, dict) else {}
+    lat = rec.location_lat
+    lng = rec.location_lng
+    if lat is None or lng is None:
+        lat = coords.get("latitude", coords.get("lat"))
+        lng = coords.get("longitude", coords.get("lon", coords.get("lng")))
+        if isinstance(lat, dict):
+            lat = lat.get("center")
+        if isinstance(lng, dict):
+            lng = lng.get("center")
+    if lat is None or lng is None:
+        return None
+    loc: dict = {"name": rec.location_name or "Unknown", "latitude": float(lat), "longitude": float(lng)}
+    b = coords.get("bounds") if isinstance(coords.get("bounds"), dict) else None
+    if b and all(k in b for k in ("lat_min", "lat_max", "lng_min", "lng_max")):
+        loc["bounds"] = b
+    elif isinstance(coords.get("latitude"), dict) and isinstance(coords.get("longitude"), dict):
+        la, lo = coords["latitude"], coords["longitude"]
+        if "min" in la and "min" in lo:
+            loc["bounds"] = {"lat_min": la["min"], "lat_max": la["max"], "lng_min": lo["min"], "lng_max": lo["max"]}
+    return loc
+
+
+def _regen_thumbnails_sync(session_ids: Optional[List[str]], only_missing: bool, limit: int) -> dict:
+    from ..config import services
+    from ..utils.thumbnail import create_satellite_thumbnail
+
+    fm = services.file_manager
+    if fm is None:
+        raise HTTPException(status_code=503, detail="File manager not initialised")
+
+    s = db_models.SessionLocal()
+    try:
+        q = s.query(AnalysisRecord)
+        if session_ids:
+            q = q.filter(AnalysisRecord.session_id.in_(session_ids))
+        rows = q.order_by(AnalysisRecord.created_at.desc()).limit(limit).all()
+
+        done: List[str] = []
+        skipped: List[str] = []
+        failed: List[str] = []
+        os.makedirs("/tmp/lleo", exist_ok=True)
+        for rec in rows:
+            if only_missing and rec.thumbnail_path and fm.file_exists(rec.thumbnail_path):
+                skipped.append(rec.session_id)
+                continue
+            loc = _location_for_thumbnail(rec)
+            if not loc:
+                failed.append(rec.session_id)
+                continue
+            local = f"/tmp/lleo/{rec.session_id}_preview.png"
+            ok = create_satellite_thumbnail(
+                location=loc,
+                analysis_type=rec.analysis_type or "analysis",
+                thumbnail_path=local,
+                start_year=rec.start_year,
+                end_year=rec.end_year,
+            )
+            if not ok:
+                failed.append(rec.session_id)
+                continue
+            try:
+                cloud_path = fm.save_file_to_cloud(local, f"analysis_results/{rec.session_id}/preview.png")
+                rec.thumbnail_path = cloud_path
+                files = dict(rec.files or {})
+                files["preview"] = cloud_path
+                rec.files = files
+                done.append(rec.session_id)
+            except Exception as exc:
+                print(f"⚠️  thumbnail upload failed for {rec.session_id}: {exc}")
+                failed.append(rec.session_id)
+            finally:
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+        s.commit()
+        return {"checked": len(rows), "regenerated": len(done), "skipped": len(skipped),
+                "failed": failed, "regenerated_ids": done}
+    finally:
+        s.close()
+
+
+@router.post("/regenerate-thumbnails", dependencies=[Depends(require_admin)])
+async def regenerate_thumbnails(
+    session_ids: Optional[List[str]] = Body(default=None, embed=True),
+    only_missing: bool = Body(default=True, embed=True),
+    limit: int = Body(default=200, embed=True),
+):
+    """Rebuild ``preview.png`` (satellite tiles fitted to the region bbox) from
+    the location stored in Cloud SQL — for rows whose GCS preview was deleted.
+    """
+    if db_models.SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not initialised")
+    return await run_in_threadpool(_regen_thumbnails_sync, session_ids, only_missing, max(1, min(limit, 2000)))
+
+
 # ── Author / publishing helpers ──────────────────────────────────────────────
 
 @router.post("/backfill-user-emails", dependencies=[Depends(require_admin)])
