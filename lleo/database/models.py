@@ -62,6 +62,9 @@ class AnalysisRecord(Base):
     session_id = Column(String, primary_key=True, index=True)
     user_id = Column(String, nullable=False, index=True)
     user_email = Column(String)
+    # Optional public display name (e.g. "Sureal.ai"). When set it is shown
+    # instead of the e-mail prefix on Community cards.
+    author_name = Column(String)
     query = Column(Text)
     analysis_type = Column(String)
     location_name = Column(String)
@@ -87,6 +90,10 @@ class AnalysisRecord(Base):
     is_shared = Column(Boolean, default=False, nullable=False, server_default=text("false"))
     shared_at = Column(DateTime)
     likes = Column(Integer, default=0, nullable=False, server_default=text("0"))
+    # True once the GCS artefacts (preview/map/charts) are gone — e.g. deleted
+    # by a bucket lifecycle rule.  Such rows are hidden from Community and
+    # rendered with a placeholder in My Analyses.
+    artifacts_expired = Column(Boolean, default=False, nullable=False, server_default=text("false"))
 
 
 class AnalysisLike(Base):
@@ -323,6 +330,8 @@ _ANALYSES_EXTRA_COLUMNS = [
     ("is_shared", "BOOLEAN NOT NULL DEFAULT false"),
     ("shared_at", "TIMESTAMP"),
     ("likes", "INTEGER NOT NULL DEFAULT 0"),
+    ("author_name", "VARCHAR"),
+    ("artifacts_expired", "BOOLEAN NOT NULL DEFAULT false"),
 ]
 
 

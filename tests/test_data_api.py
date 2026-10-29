@@ -131,6 +131,47 @@ def test_share_whole_conversation(client, db):
     assert ids == {"c1", "c2"}
 
 
+def test_author_name_and_expired_artifacts(client, db, monkeypatch):
+    _seed_analysis(db, "p1", user_id="u1", shared=True, author_name="Sureal.ai")
+    _seed_analysis(db, "p2", user_id="u2", shared=True)
+    _seed_analysis(db, "p3", user_id="u3", shared=True, artifacts_expired=True)
+
+    comm = client.get("/api/community").json()
+    by_id = {it["id"]: it for it in comm["items"]}
+    assert set(by_id) == {"p1", "p2"}                 # expired row hidden
+    assert by_id["p1"]["user_name"] == "Sureal.ai"      # explicit author wins
+    assert by_id["p2"]["user_name"] == "u2"             # e-mail prefix fallback
+    assert by_id["p1"]["artifacts_expired"] is False
+
+    mine = client.get("/api/analyses", params={"user_id": "u3"}).json()["items"][0]
+    assert mine["artifacts_expired"] is True
+    assert mine["thumbnail_url"] is None and mine["map_url"] is None
+
+    # admin publish endpoint: share + stamp author
+    from lleo.routers import admin as admin_router
+    monkeypatch.setenv("ADMIN_KEY", "k")
+    app = FastAPI()
+    app.include_router(admin_router.router)
+    ac = TestClient(app)
+    r = ac.post("/api/admin/publish", json={"session_ids": ["p2", "zzz"], "author_name": "Sureal.ai"},
+                headers={"X-Admin-Key": "k"})
+    assert r.status_code == 200 and r.json()["updated"] == 1 and r.json()["missing"] == ["zzz"]
+    assert {it["user_name"] for it in client.get("/api/community").json()["items"]} == {"Sureal.ai"}
+
+    # prune: file manager says nothing exists → all flagged (dry-run first)
+    from lleo.config import services
+    class _FM:
+        def file_exists(self, p):
+            return p.endswith("p1/map.html")
+    monkeypatch.setattr(services, "file_manager", _FM())
+    r = ac.post("/api/admin/prune-expired-artifacts", json={"dry_run": True}, headers={"X-Admin-Key": "k"})
+    assert r.status_code == 200 and set(r.json()["expired_ids"]) == {"p2"}
+    assert client.get("/api/community").json()["total"] == 2  # dry run → unchanged
+    r = ac.post("/api/admin/prune-expired-artifacts", json={"dry_run": False}, headers={"X-Admin-Key": "k"})
+    assert r.json()["expired"] == 1
+    assert [it["id"] for it in client.get("/api/community").json()["items"]] == ["p1"]
+
+
 def test_like_toggle_updates_counter_and_liked_flag(client, db):
     _seed_analysis(db, "L1", user_id="u1", shared=True)
 

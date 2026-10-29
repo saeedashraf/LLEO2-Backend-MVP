@@ -533,6 +533,14 @@ def _serve_cloud_or_local(path: str, media_type: str):
     if fm and fm.use_cloud and path.startswith("gs://"):
         try:
             data = fm.get_file_bytes_from_cloud(path)
+            if not data:
+                # Object was deleted (e.g. by a bucket lifecycle rule) or never
+                # written.  Returning 200 with an empty body made <img> tags
+                # render as blank boxes — a 404 lets the UI show a placeholder.
+                raise HTTPException(
+                    status_code=404,
+                    detail="File no longer available (artefact expired or missing)",
+                )
             if media_type == "text/html":
                 return StreamingResponse(
                     io.StringIO(data.decode("utf-8")),
@@ -544,6 +552,8 @@ def _serve_cloud_or_local(path: str, media_type: str):
                 media_type=media_type,
                 headers={"Cache-Control": "public, max-age=3600"},
             )
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Error serving file: {exc}")
 

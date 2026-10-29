@@ -81,3 +81,147 @@ async def migrate_supabase(tables: Optional[List[str]] = Body(default=None, embe
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Migration failed: {exc}")
     return {"success": True, "report": report}
+
+
+# ── Artefact housekeeping ────────────────────────────────────────────────────
+
+def _artifact_paths(rec: AnalysisRecord) -> List[str]:
+    """gs:// paths that should exist for this analysis (preview first)."""
+    paths: List[str] = []
+    if rec.thumbnail_path:
+        paths.append(rec.thumbnail_path)
+    for key in ("preview", "map", "charts", "chart", "animation"):
+        p = (rec.files or {}).get(key)
+        if p and p not in paths:
+            paths.append(p)
+    return paths
+
+
+def _prune_expired_sync(dry_run: bool, only_shared: bool, limit: int) -> dict:
+    """Mark rows whose GCS artefacts are gone as ``artifacts_expired``."""
+    from ..config import services
+
+    fm = services.file_manager
+    if fm is None:
+        raise HTTPException(status_code=503, detail="File manager not initialised")
+
+    s = db_models.SessionLocal()
+    try:
+        q = s.query(AnalysisRecord).filter(AnalysisRecord.artifacts_expired.is_(False))
+        if only_shared:
+            q = q.filter(AnalysisRecord.is_shared.is_(True))
+        rows = q.order_by(AnalysisRecord.created_at.desc()).limit(limit).all()
+
+        expired: List[str] = []
+        kept: List[str] = []
+        for rec in rows:
+            paths = _artifact_paths(rec)
+            # A row with no artefact paths at all (legacy / failed) is expired too.
+            alive = any(fm.file_exists(p) for p in paths) if paths else False
+            if alive:
+                kept.append(rec.session_id)
+            else:
+                expired.append(rec.session_id)
+                if not dry_run:
+                    rec.artifacts_expired = True
+        if not dry_run:
+            s.commit()
+        return {
+            "checked": len(rows),
+            "expired": len(expired),
+            "kept": len(kept),
+            "dry_run": dry_run,
+            "expired_ids": expired,
+        }
+    finally:
+        s.close()
+
+
+@router.post("/prune-expired-artifacts", dependencies=[Depends(require_admin)])
+async def prune_expired_artifacts(
+    dry_run: bool = Body(default=True, embed=True),
+    only_shared: bool = Body(default=False, embed=True),
+    limit: int = Body(default=1000, embed=True),
+):
+    """Scan analyses and flag those whose GCS files no longer exist.
+
+    Flagged rows are hidden from Community and shown with a placeholder in
+    My Analyses. Run with ``dry_run=false`` to persist.
+    """
+    if db_models.SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not initialised")
+    return await run_in_threadpool(_prune_expired_sync, dry_run, only_shared, max(1, min(limit, 5000)))
+
+
+# ── Author / publishing helpers ──────────────────────────────────────────────
+
+@router.post("/backfill-user-emails", dependencies=[Depends(require_admin)])
+def backfill_user_emails():
+    """Fill ``analyses.user_email`` from other rows of the same user_id.
+
+    Older analyses were written without an e-mail (the value lived in a
+    per-instance cache). If the same user has *any* row with an e-mail, copy it.
+    """
+    if db_models.SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not initialised")
+    s = db_models.SessionLocal()
+    try:
+        known = {
+            uid: email
+            for uid, email in s.query(AnalysisRecord.user_id, AnalysisRecord.user_email)
+            .filter(AnalysisRecord.user_email.isnot(None), AnalysisRecord.user_email != "")
+            .distinct()
+            .all()
+        }
+        # Also consult subscriptions (they always carry the e-mail)
+        for uid, email in s.query(Subscription.user_id, Subscription.user_email).all():
+            if email and uid not in known:
+                known[uid] = email
+
+        rows = (
+            s.query(AnalysisRecord)
+            .filter((AnalysisRecord.user_email.is_(None)) | (AnalysisRecord.user_email == ""))
+            .all()
+        )
+        updated = 0
+        for rec in rows:
+            email = known.get(rec.user_id)
+            if email:
+                rec.user_email = email
+                updated += 1
+        s.commit()
+        return {"candidates": len(rows), "updated": updated, "still_missing": len(rows) - updated}
+    finally:
+        s.close()
+
+
+@router.post("/publish", dependencies=[Depends(require_admin)])
+def publish_analyses(
+    session_ids: List[str] = Body(..., embed=True),
+    author_name: Optional[str] = Body(default=None, embed=True),
+    is_shared: bool = Body(default=True, embed=True),
+):
+    """Share (or un-share) analyses and optionally stamp a public author name."""
+    if db_models.SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not initialised")
+    from datetime import datetime
+
+    s = db_models.SessionLocal()
+    try:
+        rows = s.query(AnalysisRecord).filter(AnalysisRecord.session_id.in_(session_ids)).all()
+        found = {r.session_id for r in rows}
+        now = datetime.utcnow()
+        for rec in rows:
+            rec.is_shared = is_shared
+            rec.shared_at = now if is_shared else None
+            if author_name is not None:
+                rec.author_name = author_name.strip() or None
+        s.commit()
+        return {
+            "updated": len(rows),
+            "missing": [sid for sid in session_ids if sid not in found],
+            "is_shared": is_shared,
+            "author_name": author_name,
+        }
+    finally:
+        s.close()

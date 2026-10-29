@@ -56,9 +56,21 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def display_name_for(rec: AnalysisRecord) -> Optional[str]:
+    """Public author label: explicit author_name, else the e-mail prefix."""
+    name = (rec.author_name or "").strip()
+    if name:
+        return name
+    email = (rec.user_email or "").strip()
+    if email and "@" in email:
+        return email.split("@", 1)[0]
+    return None
+
+
 def serialize_analysis(rec: AnalysisRecord, liked_ids: Optional[set] = None) -> Dict[str, Any]:
     """AnalysisRecord → the JSON shape the React `Analysis` type expects."""
-    urls = build_file_urls(rec.session_id, rec.files or {})
+    expired = bool(getattr(rec, "artifacts_expired", False))
+    urls = {} if expired else build_file_urls(rec.session_id, rec.files or {})
     return {
         "id": rec.session_id,
         "session_id": rec.session_id,
@@ -66,6 +78,9 @@ def serialize_analysis(rec: AnalysisRecord, liked_ids: Optional[set] = None) -> 
         "conversation_id": rec.conversation_id,
         "user_id": rec.user_id,
         "user_email": rec.user_email,
+        "user_name": display_name_for(rec),
+        "author_name": rec.author_name,
+        "artifacts_expired": expired,
         "query": rec.query,
         "analysis_type": rec.analysis_type,
         "location": rec.location_name,
@@ -173,7 +188,10 @@ def list_community(
     db: Session = Depends(get_db),
 ):
     page, per_page, offset = _page_params(page, per_page)
-    base = db.query(AnalysisRecord).filter(AnalysisRecord.is_shared.is_(True))
+    base = db.query(AnalysisRecord).filter(
+        AnalysisRecord.is_shared.is_(True),
+        AnalysisRecord.artifacts_expired.is_(False),
+    )
     total = base.with_entities(func.count(AnalysisRecord.session_id)).scalar() or 0
     rows = (
         base.order_by(AnalysisRecord.shared_at.desc().nullslast(), AnalysisRecord.created_at.desc())

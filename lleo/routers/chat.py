@@ -37,7 +37,8 @@ from ..services import credits_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# Cache user_id → user_email for persisting analyses
+# Per-process fallback cache user_id → user_email. The authoritative copy is
+# stored on the ConversationState (Cloud SQL) so it survives across instances.
 _user_emails: dict[str, str] = {}
 
 
@@ -83,7 +84,7 @@ async def start_conversation(
             _user_emails[user_id] = user_email
 
         # Create conversation state in the existing manager
-        conversation_mgr.create_conversation(session_id, user_id, query)
+        conversation_mgr.create_conversation(session_id, user_id, query, user_email=user_email)
 
         # Single-call routing
         decision: RoutingDecision = await route_query(query)
@@ -210,6 +211,7 @@ async def analyze_from_conversation(
             raise HTTPException(status_code=404, detail="Session not found")
 
         user_id = state.user_id if hasattr(state, "user_id") else "unknown"
+        user_email = getattr(state, "user_email", None) or _user_emails.get(user_id, "")
 
         # ── Reconstruct RoutingDecision from stored state (no 2nd Gemini call) ──
         prior = extract_prior_fields(sid)
@@ -253,7 +255,7 @@ async def analyze_from_conversation(
             orig_query = ctx.split("User: ")[1].split("\n")[0] if "User: " in ctx else "analysis"
 
         bg_sid = await _launch_analysis(
-            background_tasks, sid, user_id, orig_query, decision
+            background_tasks, sid, user_id, orig_query, decision, user_email=user_email
         )
 
         return {
@@ -345,6 +347,7 @@ async def _launch_analysis(
     user_id: str,
     query: str,
     decision: RoutingDecision,
+    user_email: str = "",
 ) -> str:
     """Create analysis request, processor, queue background work, return analysis session_id."""
     _check_credits_or_raise(user_id)
@@ -436,8 +439,8 @@ async def _launch_analysis(
         conversation_session_id=conv_session_id,
     )
 
-    # Attach user_email for Supabase persistence
-    req.user_email = _user_emails.get(user_id, "")  # type: ignore[attr-defined]
+    # Attach user_email so the analysis row carries its author
+    req.user_email = user_email or _user_emails.get(user_id, "")  # type: ignore[attr-defined]
 
     # Register in-memory session for status polling
     services.analysis_sessions[analysis_sid] = {

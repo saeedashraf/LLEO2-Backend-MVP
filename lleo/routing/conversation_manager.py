@@ -21,6 +21,10 @@ class ConversationState:
         self.session_id = session_id
         self.conversation_id = session_id  # conversation_id is same as session_id
         self.user_id = user_id
+        # E-mail of the user who started the conversation. Persisted with the
+        # state so the analysis author is known on *any* Cloud Run instance
+        # (previously it lived in a per-process dict → "Anonymous" cards).
+        self.user_email: Optional[str] = None
         self.initial_query = initial_query
         self.created_at = datetime.now().isoformat()
         self.messages: List[Dict[str, str]] = []
@@ -51,6 +55,7 @@ class ConversationState:
             'session_id': self.session_id,
             'conversation_id': self.conversation_id,
             'user_id': self.user_id,
+            'user_email': self.user_email,
             'initial_query': self.initial_query,
             'created_at': self.created_at,
             'messages': self.messages,
@@ -75,6 +80,7 @@ class ConversationState:
         # conversation_id is already set in __init__, but restore if present in data
         if 'conversation_id' in data:
             state.conversation_id = data['conversation_id']
+        state.user_email = data.get('user_email')
         state.created_at = data['created_at']
         state.messages = data['messages']
         state.analysis_type = data.get('analysis_type')
@@ -132,8 +138,11 @@ class ConversationManager:
             s.close()
 
     # ---------------------------------------------------------------- public API
-    def create_conversation(self, session_id: str, user_id: str, query: str) -> ConversationState:
+    def create_conversation(
+        self, session_id: str, user_id: str, query: str, user_email: Optional[str] = None
+    ) -> ConversationState:
         state = ConversationState(session_id, user_id, query)
+        state.user_email = (user_email or "").strip() or None
         self._local_cache[session_id] = state
         self._persist(state, create=True)
         return state
