@@ -14,7 +14,9 @@ GET  /credits/{user_id}
 from __future__ import annotations
 
 from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
+from ..services import credits_service
 from ..stripe_handler import stripe_handler
 from ..supabase_client import supabase_client
 
@@ -137,22 +139,12 @@ async def reactivate_subscription(user_email: str = Form(...)):
 
 @router.get("/credits/{user_id}")
 async def get_user_credits(user_id: str):
-    """Return the user's remaining credits from Supabase."""
+    """Return the user's remaining credits (Cloud SQL; row auto-created)."""
     try:
-        resp = (
-            supabase_client.client
-            .table("user_credits")
-            .select("*")
-            .eq("user_id", user_id)
-            .single()
-            .execute()
-        )
-        if resp.data:
-            return resp.data
-        return {"user_id": user_id, "credits": 0}
+        return await run_in_threadpool(credits_service.ensure_user_credits, user_id)
     except Exception as exc:
         print(f"⚠️  Credits lookup: {exc}")
-        return {"user_id": user_id, "credits": 0}
+        return {"user_id": user_id, "credits": 0, "total_used": 0}
 
 
 # ── GET /api/billing/invoices ────────────────────────────────────────────────

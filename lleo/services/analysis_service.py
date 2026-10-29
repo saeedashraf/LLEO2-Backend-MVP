@@ -1,23 +1,84 @@
 """
 LLEO v2 — Analysis orchestration service.
 
-Background processing, GCS saves, Supabase + Postgres persistence.
+Background processing, GCS saves, Cloud SQL persistence, credit deduction.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
-import uuid as _uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
 from ..core.base_processor import AnalysisRequest, AnalysisResult
 from ..processors import get_processor
-from ..supabase_client import supabase_client
 from ..database.models import AnalysisRecord, get_db
 from ..utils.thumbnail import create_satellite_thumbnail
+from . import credits_service
+
+ANALYSIS_CREDIT_COST = int(os.getenv("LLEO_ANALYSIS_CREDIT_COST", "1"))
+
+
+# ── Worker pool for analyses ─────────────────────────────────────────────────
+#
+# Every processor does blocking I/O and CPU work (Earth Engine getInfo(),
+# rasterio, Gemini generate_content, GCS uploads, SQLAlchemy).  If that runs
+# on the event loop — directly or inside an `async def` that never truly
+# yields — the whole API freezes for the duration of the job (measured:
+# /health took 82 s while a water-quality analysis ran).
+#
+# Analyses are therefore executed on a dedicated thread pool.  A dedicated
+# pool (rather than the loop's default executor) keeps heavy jobs from
+# starving the threads FastAPI uses for sync dependencies such as get_db().
+
+_ANALYSIS_WORKERS = int(os.getenv("LLEO_ANALYSIS_WORKERS", "4"))
+_analysis_executor = ThreadPoolExecutor(
+    max_workers=_ANALYSIS_WORKERS, thread_name_prefix="lleo-analysis"
+)
+
+
+def _run_processor_sync(processor, request: AnalysisRequest) -> AnalysisResult:
+    """Run a processor to completion on the *current* (worker) thread.
+
+    Sync processors are called directly.  Async processors get their own
+    short-lived event loop in this thread; their internal awaits are all
+    on blocking code anyway, so nothing is lost and the main loop is spared.
+    """
+    if inspect.iscoroutinefunction(processor.process):
+        return asyncio.run(processor.process(request))
+    return processor.process(request)
+
+
+# ── File URL helper (shared by routers) ──────────────────────────────────────
+
+def build_file_urls(session_id: str, outputs: Optional[dict] = None) -> dict:
+    """Return the `/results/...` URLs that actually exist for an analysis.
+
+    `outputs` is the processor's result.outputs dict ({map, charts, preview,
+    animation, ...}).  Only artefacts present in it are advertised, so a
+    video_animation job no longer claims a `map_url` that 404s.
+
+    When `outputs` is None (job still running) only the endpoints that are
+    valid for every analysis type are returned.
+    """
+    urls = {
+        "preview_url": f"/results/{session_id}/preview",
+        "download_url": f"/results/{session_id}/download",
+        "metadata_url": f"/results/{session_id}/metadata",
+    }
+    if not outputs:
+        return urls
+    if outputs.get("map"):
+        urls["map_url"] = f"/results/{session_id}/map"
+    if outputs.get("charts") or outputs.get("chart"):
+        urls["chart_url"] = f"/results/{session_id}/chart"
+    if outputs.get("animation"):
+        urls["animation_url"] = f"/results/{session_id}/animation"
+    return urls
 
 
 # ── Public helpers ───────────────────────────────────────────────────────────
@@ -65,7 +126,29 @@ async def process_analysis_background(
     sessions: dict,
     file_manager,
 ) -> None:
-    """Run the processor in the background and persist results everywhere."""
+    """Background entry point — off-loads the whole job to the worker pool.
+
+    Keeps the event loop free so /health, /status, /chat etc. stay
+    responsive while analyses run.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        _analysis_executor,
+        _process_analysis_sync,
+        processor,
+        request,
+        sessions,
+        file_manager,
+    )
+
+
+def _process_analysis_sync(
+    processor,
+    request: AnalysisRequest,
+    sessions: dict,
+    file_manager,
+) -> None:
+    """Run the processor and persist results everywhere (worker thread)."""
     sid = request.session_id
 
     try:
@@ -73,22 +156,20 @@ async def process_analysis_background(
         sessions[sid]["progress"] = 10
         sessions[sid]["message"] = "Processing data…"
 
-        # Run (handles sync & async processors)
-        if inspect.iscoroutinefunction(processor.process):
-            result: AnalysisResult = await processor.process(request)
-        else:
-            result = processor.process(request)
+        result: AnalysisResult = _run_processor_sync(processor, request)
 
+        # The processor is finished, but the artefacts are not yet servable:
+        # /results/{sid}/* reads from the Postgres record, which is written
+        # below. Keep the session in "processing" until persistence is done
+        # so clients never see "completed" before the files are retrievable.
         sessions[sid].update({
-            "status": result.status,
-            "progress": 100,
-            "message": "Analysis completed",
+            "progress": 90,
+            "message": "Saving results…",
             "result": {
                 "outputs": result.outputs,
                 "metadata": result.metadata,
                 "processing_time": result.processing_time,
             },
-            "completed_at": datetime.now().isoformat(),
         })
 
         # GCS artefacts
@@ -111,8 +192,20 @@ async def process_analysis_background(
         })
 
         _normalise_preview(file_manager, sid, result)
-        _save_to_supabase(file_manager, sid, request, result)
         _save_to_postgres(file_manager, sid, request, result, processor)
+
+        # Only now are the artefact endpoints guaranteed to resolve.
+        sessions[sid].update({
+            "status": result.status,
+            "progress": 100,
+            "message": "Analysis completed",
+            "completed_at": datetime.now().isoformat(),
+        })
+
+        # Charge the user (server-side, idempotent per session id)
+        credits_left = _deduct_analysis_credit(request)
+        if credits_left is not None:
+            sessions[sid]["credits_remaining"] = credits_left
 
         # Save completion message to conversation timeline
         _save_completion_message(request, result)
@@ -224,100 +317,42 @@ def _is_unserializable(obj) -> bool:
     return cls_name in ("Image", "ComputedObject", "Element")
 
 
-def _save_to_supabase(fm, sid, req, result) -> None:
-    if not (result.outputs.get("map") or result.outputs.get("charts") or result.outputs.get("animation")):
-        print(f"ℹ️  Skip Supabase — no map/charts/animation for {sid}")
-        return
+def _deduct_analysis_credit(req: AnalysisRequest) -> Optional[int]:
+    """Charge ANALYSIS_CREDIT_COST credits for a finished analysis.
 
+    Idempotent per session id (retried callbacks never double-charge).
+    Returns the remaining balance, or None if the deduction could not run.
+    """
+    if ANALYSIS_CREDIT_COST <= 0:
+        return None
     try:
-        bn = fm.bucket_name
-        be = os.getenv(
-            "BACKEND_URL",
-            "https://ndvi6-analysis-api-258557095482.us-central1.run.app",
+        loc = req.location.get("name", "") if isinstance(req.location, dict) else ""
+        res = credits_service.deduct_credits(
+            req.user_id,
+            ANALYSIS_CREDIT_COST,
+            analysis_id=req.session_id,
+            description=f"{req.analysis_type.replace('_', ' ')} analysis"
+                        + (f" — {loc}" if loc else ""),
         )
+        if not res.get("success"):
+            print(f"⚠️  Credit deduction failed for {req.session_id}: {res.get('error')}")
+        return res.get("credits")
+    except Exception as exc:
+        print(f"⚠️  Credit deduction error: {exc}")
+        return None
+
+
+def _save_to_postgres(fm, sid, req, result, processor) -> None:
+    """Persist the analysis row in Cloud SQL (single source of truth)."""
+    db = None
+    try:
+        db = next(get_db())
+        thumb = _generate_thumbnail(fm, sid, req, result, processor)
 
         loc = req.location
         loc_name = loc.get("name", str(loc)) if isinstance(loc, dict) else str(loc)
         loc_lat = loc.get("latitude") if isinstance(loc, dict) else None
         loc_lng = loc.get("longitude") if isinstance(loc, dict) else None
-
-        # ── Collect conversation history ──
-        conv_history: list = []
-        conv_sid = getattr(req, "conversation_session_id", None)
-        if conv_sid:
-            try:
-                from ..routing.conversation_manager import conversation_manager
-                cs = conversation_manager.get_conversation(conv_sid)
-                if cs and cs.messages:
-                    conv_history = cs.messages
-            except Exception as exc:
-                print(f"⚠️  Could not load conversation for Supabase: {exc}")
-
-        # Convert conversation_session_id to UUID (must match conversation_messages table)
-        db_conv_id = None
-        if conv_sid:
-            clean_id = conv_sid.replace("chat_", "") if conv_sid.startswith("chat_") else conv_sid
-            try:
-                _uuid.UUID(clean_id)
-                db_conv_id = clean_id
-            except ValueError:
-                db_conv_id = str(_uuid.uuid5(_uuid.NAMESPACE_DNS, clean_id))
-
-        row = {
-            "session_id": sid,
-            "analysis_session_id": sid,
-            "conversation_id": db_conv_id,
-            "user_id": req.user_id,
-            "user_email": getattr(req, "user_email", "") or "",
-            "query": req.query,
-            "analysis_type": req.analysis_type,
-            "location": loc_name,
-            "location_lat": loc_lat,
-            "location_lng": loc_lng,
-            "start_year": (req.time_period or {}).get("start_year"),
-            "end_year": (req.time_period or {}).get("end_year"),
-            "parameters": req.parameters or {},
-            "storage_path": f"analysis_results/{sid}/",
-            "bucket_name": bn,
-            "map_url": _gs_to_backend_url(result.outputs.get("map", ""), bn),
-            "chart_url": _gs_to_public_url(result.outputs.get("charts", ""), bn),
-            "charts_url": _gs_to_public_url(result.outputs.get("charts", ""), bn),
-            "preview_url": _gs_to_public_url(result.outputs.get("preview", ""), bn),
-            "thumbnail_url": _gs_to_public_url(result.outputs.get("preview", ""), bn) if result.outputs.get("preview") else f"{be}/results/{sid}/preview",
-            "animation_url": _gs_to_public_url(result.outputs.get("animation", ""), bn),
-            "results_json_url": f"gs://{bn}/analysis_results/{sid}/results.json",
-            "status": "completed",
-            "is_shared": False,
-            "created_at": datetime.now().isoformat(),
-            "completed_at": datetime.now().isoformat(),
-            "metadata": _clean_metadata(result.metadata),
-            "processing_time_seconds": result.processing_time,
-            "conversation_history": conv_history or [],
-        }
-        try:
-            supabase_client.client.table("analyses").insert(row).execute()
-        except Exception:
-            # Retry without columns that may not exist yet
-            row.pop("user_email", None)
-            row.pop("animation_url", None)
-            supabase_client.client.table("analyses").insert(row).execute()
-        print(f"💾 Supabase: {sid}")
-    except Exception as exc:
-        import traceback
-        print(f"⚠️  Supabase save: {exc}")
-        traceback.print_exc()
-
-
-def _save_to_postgres(fm, sid, req, result, processor) -> None:
-    try:
-        db = next(get_db())
-        thumb = _generate_thumbnail(fm, sid, req, result, processor)
-
-        loc_name = (
-            req.location.get("name", str(req.location))
-            if isinstance(req.location, dict)
-            else str(req.location)
-        )
 
         conv_history: list = []
         conv_sid = getattr(req, "conversation_session_id", None)
@@ -330,32 +365,62 @@ def _save_to_postgres(fm, sid, req, result, processor) -> None:
             except Exception:
                 pass
 
-        record = AnalysisRecord(
-            session_id=sid,
+        conversation_id = None
+        if conv_sid:
+            conversation_id = conv_sid[5:] if conv_sid.startswith("chat_") else conv_sid
+
+        bn = getattr(fm, "bucket_name", None) or ""
+        preview = result.outputs.get("preview", "")
+        thumbnail_url = thumb or (_gs_to_public_url(preview, bn) if preview else None)
+
+        values = dict(
             user_id=req.user_id,
+            user_email=getattr(req, "user_email", None) or None,
             query=req.query,
             analysis_type=req.analysis_type,
             location_name=loc_name,
-            coordinates=result.metadata.get("coordinates"),
+            location_lat=loc_lat,
+            location_lng=loc_lng,
+            coordinates=result.metadata.get("coordinates") if isinstance(result.metadata, dict) else None,
             start_year=(req.time_period or {}).get("start_year"),
             end_year=(req.time_period or {}).get("end_year"),
+            parameters=req.parameters or {},
             files=result.outputs,
             status="completed",
             thumbnail_path=thumb,
-            thumbnail_url=thumb,
+            thumbnail_url=thumbnail_url,
             map_url=result.outputs.get("map"),
             chart_url=result.outputs.get("charts"),
             results_data=_clean_metadata(result.metadata),
             conversation_history=conv_history,
+            conversation_id=conversation_id,
+            processing_time_seconds=result.processing_time,
         )
-        db.add(record)
+
+        record = db.get(AnalysisRecord, sid)
+        if record is None:
+            record = AnalysisRecord(session_id=sid, **values)
+            db.add(record)
+        else:
+            for k, v in values.items():
+                setattr(record, k, v)
         db.commit()
-        db.close()
-        print(f"💾 Postgres: {sid}")
+        print(f"💾 Cloud SQL: {sid}")
     except Exception as exc:
         import traceback
-        print(f"⚠️  Postgres save: {exc}")
+        print(f"⚠️  Cloud SQL save: {exc}")
         traceback.print_exc()
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _generate_thumbnail(fm, sid, req, result, processor) -> Optional[str]:

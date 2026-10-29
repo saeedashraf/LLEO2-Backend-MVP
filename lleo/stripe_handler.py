@@ -88,7 +88,9 @@ class StripeHandler:
                 status='active',
                 plan_type='pro',
                 current_period_start=period_start_iso,
-                current_period_end=period_end_iso
+                current_period_end=period_end_iso,
+                cancel_at_period_end=bool(event_data.get('cancel_at_period_end', False)),
+                user_email=customer_email,
             )
 
             print(f"✅ Subscription created for user {user_id}")
@@ -123,6 +125,7 @@ class StripeHandler:
             update_kwargs = {
                 'user_id': user_id,
                 'status': status,
+                'cancel_at_period_end': bool(event_data.get('cancel_at_period_end', False)),
             }
             if period_start_iso:
                 update_kwargs['current_period_start'] = period_start_iso
@@ -156,7 +159,8 @@ class StripeHandler:
             supabase_client.update_subscription(
                 user_id=user_id,
                 status='canceled',
-                plan_type='free'
+                plan_type='free',
+                cancel_at_period_end=False,
             )
 
             print(f"✅ Subscription {subscription_id} canceled")
@@ -465,7 +469,11 @@ class StripeHandler:
                 if user:
                     if not cancelling_at_end:
                         supabase_client.update_subscription(
-                            user_id=user['id'], status='canceled', plan_type='free')
+                            user_id=user['id'], status='canceled', plan_type='free',
+                            cancel_at_period_end=False)
+                    else:
+                        supabase_client.update_subscription(
+                            user_id=user['id'], cancel_at_period_end=True)
                     cr = supabase_client.get_user_credits(user['id'])
                     remaining = cr.get('credits', 0) if cr else 0
             except Exception as db_err:
@@ -554,6 +562,15 @@ class StripeHandler:
                 subscription.id,
                 cancel_at_period_end=False
             )
+
+            try:
+                user = supabase_client.get_user_by_email(user_email)
+                if user:
+                    supabase_client.update_subscription(
+                        user_id=user['id'], status='active', plan_type='pro',
+                        cancel_at_period_end=False)
+            except Exception as db_err:
+                print(f"⚠️ Could not update subscription row after reactivate: {db_err}")
 
             print(f"✅ Subscription {subscription.id} reactivated for {user_email}")
             return {

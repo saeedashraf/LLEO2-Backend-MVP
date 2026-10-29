@@ -1,53 +1,75 @@
 """
-Supabase Client for Credit and Subscription Management
+Supabase Client — AUTH ONLY.
+
+Supabase is used exclusively for authentication (sign-up / sign-in / password
+reset / looking up a user id by e-mail).  All application data — analyses,
+credits, subscriptions, payments, likes, conversation messages — lives in
+Cloud SQL and is accessed through ``lleo.services.credits_service`` and the
+``/api/*`` routers.
+
+The credit / subscription / payment helper methods below are kept as thin
+wrappers around ``credits_service`` so existing callers (Stripe webhooks)
+keep working without changes.
 """
 import os
-from supabase import create_client, Client
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
+from .services import credits_service
+
 load_dotenv()
 
+
 class SupabaseClient:
-    """Manages Supabase operations for credits and subscriptions"""
+    """Auth lookups (Supabase) + transactional e-mails (Resend)."""
 
     def __init__(self):
         self.url = os.getenv("SUPABASE_URL")
-        # Use SERVICE_ROLE_KEY for backend operations (bypasses RLS)
+        # Use SERVICE_ROLE_KEY for backend operations (admin auth API)
         self.key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        self.client = None
 
         if not self.url or not self.key:
-            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env")
+            print("⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — auth lookups disabled")
+            return
 
-        self.client: Client = create_client(self.url, self.key)
-        print(f"✅ Supabase client initialized: {self.url}")
-
-    def table(self, table_name: str):
-        """Forward table() calls to the underlying Supabase client"""
-        return self.client.table(table_name)
-
-    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        """Get user by email address"""
         try:
-            # List all users and filter by email (admin operation)
-            response = self.client.auth.admin.list_users()
-            for user in response:
-                if user.email == email:
-                    return {
-                        'id': str(user.id),
-                        'email': user.email,
-                        'created_at': user.created_at
-                    }
+            from supabase import create_client
+            self.client = create_client(self.url, self.key)
+            print(f"✅ Supabase auth client initialized: {self.url}")
+        except Exception as e:
+            print(f"⚠️  Supabase client init failed: {e}")
+
+    # ------------------------------------------------------------------ auth
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Resolve a Supabase auth user by e-mail (admin API)."""
+        if self.client is None or not email:
             return None
+        try:
+            email_l = email.strip().lower()
+            page = 1
+            while True:
+                users = self.client.auth.admin.list_users(page=page, per_page=1000)
+                if not users:
+                    return None
+                for user in users:
+                    if (user.email or "").lower() == email_l:
+                        return {
+                            'id': str(user.id),
+                            'email': user.email,
+                            'created_at': user.created_at
+                        }
+                if len(users) < 1000:
+                    return None
+                page += 1
         except Exception as e:
             print(f"Error getting user by email: {e}")
             return None
 
+    # --------------------------------------------- data (delegated to Cloud SQL)
     def get_user_credits(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user's current credit balance"""
         try:
-            response = self.client.table('user_credits').select('*').eq('user_id', user_id).single().execute()
-            return response.data
+            return credits_service.ensure_user_credits(user_id)
         except Exception as e:
             print(f"Error getting user credits: {e}")
             return None
@@ -59,24 +81,7 @@ class SupabaseClient:
         transaction_type: str = 'subscription_renewal',
         description: str = 'Monthly credit allocation'
     ) -> bool:
-        """Add credits to user account using Supabase RPC function"""
-        try:
-            response = self.client.rpc('add_credits', {
-                'p_user_id': user_id,
-                'p_amount': amount,
-                'p_transaction_type': transaction_type,
-                'p_description': description
-            }).execute()
-
-            if response.data and response.data.get('success'):
-                print(f"✅ Added {amount} credits to user {user_id}")
-                return True
-            else:
-                print(f"❌ Failed to add credits: {response.data}")
-                return False
-        except Exception as e:
-            print(f"Error adding credits: {e}")
-            return False
+        return credits_service.add_credits(user_id, amount, transaction_type, description)
 
     def deduct_credits(
         self,
@@ -85,73 +90,15 @@ class SupabaseClient:
         analysis_id: Optional[str] = None,
         description: str = 'Analysis usage'
     ) -> bool:
-        """Deduct credits from user account using Supabase RPC function"""
-        try:
-            response = self.client.rpc('deduct_credits', {
-                'p_user_id': user_id,
-                'p_amount': amount,
-                'p_analysis_id': analysis_id,
-                'p_description': description
-            }).execute()
+        result = credits_service.deduct_credits(user_id, amount, analysis_id, description)
+        return bool(result.get("success"))
 
-            if response.data and response.data.get('success'):
-                print(f"✅ Deducted {amount} credits from user {user_id}")
-                return True
-            else:
-                print(f"❌ Failed to deduct credits: {response.data}")
-                return False
-        except Exception as e:
-            print(f"Error deducting credits: {e}")
-            return False
-
-    def update_subscription(
-        self,
-        user_id: str,
-        stripe_customer_id: Optional[str] = None,
-        stripe_subscription_id: Optional[str] = None,
-        stripe_price_id: Optional[str] = None,
-        status: Optional[str] = None,
-        plan_type: Optional[str] = None,
-        current_period_start: Optional[int] = None,
-        current_period_end: Optional[int] = None
-    ) -> bool:
-        """Update or insert subscription information (UPSERT)"""
-        try:
-            upsert_data = {
-                'user_id': user_id,
-                'plan_type': plan_type or 'free',
-                'status': status or 'inactive'
-            }
-
-            if stripe_customer_id:
-                upsert_data['stripe_customer_id'] = stripe_customer_id
-            if stripe_subscription_id:
-                upsert_data['stripe_subscription_id'] = stripe_subscription_id
-            if stripe_price_id:
-                upsert_data['stripe_price_id'] = stripe_price_id
-            if current_period_start:
-                upsert_data['current_period_start'] = current_period_start
-            if current_period_end:
-                upsert_data['current_period_end'] = current_period_end
-
-            # Use upsert to insert if not exists, update if exists
-            response = self.client.table('subscriptions').upsert(
-                upsert_data,
-                on_conflict='user_id'  # Upsert based on user_id
-            ).execute()
-            print(f"✅ Upserted subscription for user {user_id}")
-            return True
-        except Exception as e:
-            print(f"Error upserting subscription: {e}")
-            return False
+    def update_subscription(self, user_id: str, **kwargs) -> bool:
+        return credits_service.update_subscription(user_id, **kwargs)
 
     def get_subscription_by_stripe_id(self, stripe_subscription_id: str) -> Optional[Dict[str, Any]]:
-        """Get subscription by Stripe subscription ID"""
         try:
-            response = self.client.table('subscriptions').select('*').eq(
-                'stripe_subscription_id', stripe_subscription_id
-            ).single().execute()
-            return response.data
+            return credits_service.get_subscription_by_stripe_id(stripe_subscription_id)
         except Exception as e:
             print(f"Error getting subscription: {e}")
             return None
@@ -166,22 +113,10 @@ class SupabaseClient:
         status: str = 'succeeded',
         description: Optional[str] = None
     ) -> bool:
-        """Record payment in payment_history table"""
-        try:
-            self.client.table('payment_history').insert({
-                'user_id': user_id,
-                'stripe_payment_intent_id': stripe_payment_intent_id,
-                'stripe_invoice_id': stripe_invoice_id,
-                'amount': amount,
-                'currency': currency,
-                'status': status,
-                'description': description
-            }).execute()
-            print(f"✅ Payment record created for user {user_id}")
-            return True
-        except Exception as e:
-            print(f"Error creating payment record: {e}")
-            return False
+        return credits_service.create_payment_record(
+            user_id, stripe_payment_intent_id, stripe_invoice_id,
+            amount, currency, status, description,
+        )
 
     def send_upgrade_email(self, user_email: str, credits_added: int, amount_paid: float) -> bool:
         """Send thank you email using Resend"""

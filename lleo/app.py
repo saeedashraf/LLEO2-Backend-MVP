@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import services
-from .routers import chat, results, billing, health
+from .routers import chat, results, billing, health, data, admin
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -50,3 +50,5 @@ app.include_router(health.router)    # GET /, /health, /processors, /api/logs
 app.include_router(chat.router)      # POST /chat/start, /chat/continue, /chat/analyze
 app.include_router(results.router)   # POST /analyze, GET /status/*, /results/*, /gallery/*
 app.include_router(billing.router)   # POST /api/stripe/webhook, /api/billing/*
+app.include_router(data.router)      # /api/analyses, /api/community, /api/credits, /api/conversations/*
+app.include_router(admin.router)     # /api/admin/* (X-Admin-Key protected)

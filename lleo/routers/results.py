@@ -42,6 +42,7 @@ from ..services.router_service import route_query
 from ..services.geocoding_service import build_location_from_decision, flatten_location
 from ..services.analysis_service import (
     build_analysis_request,
+    build_file_urls,
     create_processor,
     process_analysis_background,
 )
@@ -70,9 +71,11 @@ class GalleryItem(BaseModel):
     end_year: Optional[int] = None
     created_at: datetime
     thumbnail_url: str
-    map_url: str
-    chart_url: str
     download_url: str
+    # Only set when the artefact actually exists for this analysis
+    map_url: Optional[str] = None
+    chart_url: Optional[str] = None
+    animation_url: Optional[str] = None
 
 
 # ── POST /analyze  (legacy one-shot) ─────────────────────────────────────────
@@ -216,7 +219,7 @@ async def analyze_query(
             user_id=user_id,
             analysis_type=decision.intent.value,
             analysis=loc,
-            files=_file_urls(session_id),
+            files=build_file_urls(session_id),
             created_at=datetime.now(),
             status="processing",
         )
@@ -244,8 +247,11 @@ async def get_analysis_status(session_id: str, db: Session = Depends(get_db)):
             "location": mem.get("location"),
         }
         if mem.get("status") == "completed":
-            resp["files"] = _file_urls(session_id)
-            resp["result"] = mem.get("result")
+            result = mem.get("result") or {}
+            resp["files"] = build_file_urls(session_id, result.get("outputs"))
+            resp["result"] = result
+            if mem.get("credits_remaining") is not None:
+                resp["credits_remaining"] = mem["credits_remaining"]
         if mem.get("status") == "failed":
             resp["error"] = mem.get("error")
         return resp
@@ -269,7 +275,7 @@ async def get_analysis_status(session_id: str, db: Session = Depends(get_db)):
     if analysis.status == "processing" and analysis.results_data:
         resp["progress"] = analysis.results_data.get("progress", "Processing...")
     if analysis.status == "completed":
-        resp["files"] = _file_urls(session_id)
+        resp["files"] = build_file_urls(session_id, analysis.files)
     if analysis.status == "failed" and analysis.results_data:
         resp["error"] = analysis.results_data.get("error", "Unknown error")
     return resp
@@ -292,22 +298,26 @@ async def get_user_gallery(
         .limit(limit)
         .all()
     )
-    return [
-        GalleryItem(
-            session_id=a.session_id,
-            analysis_type=a.analysis_type or "ndvi",
-            location_name=a.location_name or "Unknown Location",
-            query=a.query or "",
-            start_year=a.start_year,
-            end_year=a.end_year,
-            created_at=a.created_at,
-            thumbnail_url=f"/results/{a.session_id}/preview",
-            map_url=f"/results/{a.session_id}/map",
-            chart_url=f"/results/{a.session_id}/chart",
-            download_url=f"/results/{a.session_id}/download",
+    items: List[GalleryItem] = []
+    for a in analyses:
+        urls = build_file_urls(a.session_id, a.files)
+        items.append(
+            GalleryItem(
+                session_id=a.session_id,
+                analysis_type=a.analysis_type or "ndvi",
+                location_name=a.location_name or "Unknown Location",
+                query=a.query or "",
+                start_year=a.start_year,
+                end_year=a.end_year,
+                created_at=a.created_at,
+                thumbnail_url=urls["preview_url"],
+                download_url=urls["download_url"],
+                map_url=urls.get("map_url"),
+                chart_url=urls.get("chart_url"),
+                animation_url=urls.get("animation_url"),
+            )
         )
-        for a in analyses
-    ]
+    return items
 
 
 # ── GET /results/{session_id}/preview ────────────────────────────────────────
@@ -466,6 +476,13 @@ async def delete_analysis(
         except Exception:
             pass
 
+    # Likes referencing this analysis
+    try:
+        from ..database.models import AnalysisLike
+        db.query(AnalysisLike).filter(AnalysisLike.session_id == session_id).delete()
+    except Exception:
+        pass
+
     db.delete(analysis)
     db.commit()
     return {"message": "Analysis deleted successfully"}
@@ -498,16 +515,6 @@ async def serve_file(session_id: str, filename: str):
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────
-
-def _file_urls(sid: str) -> dict:
-    return {
-        "preview_url": f"/results/{sid}/preview",
-        "map_url": f"/results/{sid}/map",
-        "chart_url": f"/results/{sid}/chart",
-        "download_url": f"/results/{sid}/download",
-        "metadata_url": f"/results/{sid}/metadata",
-    }
-
 
 def _get_record(session_id: str, db: Session) -> AnalysisRecord:
     rec = (

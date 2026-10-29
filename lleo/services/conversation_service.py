@@ -2,13 +2,11 @@
 LLEO v2 — Conversation service.
 
 Thin wrapper around the existing ConversationManager and the
-Supabase conversation_messages table.
+Cloud SQL ``conversation_messages`` table.
 """
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
 from typing import Optional
 
 from ..routing.conversation_manager import (
@@ -17,12 +15,26 @@ from ..routing.conversation_manager import (
     conversation_manager,        # singleton already instantiated
     parse_parameter_selection,
 )
-from ..supabase_client import supabase_client
 
 
 # Re-export the singleton so routers do:
 #   from ..services.conversation_service import conversation_mgr
 conversation_mgr = conversation_manager
+
+
+_ROLE_TO_TYPE = {
+    "user": "question",
+    "assistant": "answer",
+    "system": "clarification",
+}
+_ALLOWED_TYPES = ("question", "answer", "clarification", "analysis_result")
+
+
+def normalise_conversation_id(conversation_id: str) -> str:
+    """``chat_<id>`` and ``<id>`` refer to the same conversation."""
+    if not conversation_id:
+        return conversation_id
+    return conversation_id[5:] if conversation_id.startswith("chat_") else conversation_id
 
 
 def save_message(
@@ -34,62 +46,75 @@ def save_message(
     metadata: Optional[dict] = None,
 ) -> None:
     """
-    Persist a message to the Supabase ``conversation_messages`` table
-    AND update the in-memory ConversationState so that
-    build_conversation_context() sees the full history.
-    Non-blocking: failures are logged but never raised.
+    Persist a message to the Cloud SQL ``conversation_messages`` table
+    AND update the ConversationState so that build_conversation_context()
+    sees the full history.  Failures are logged but never raised.
     """
-    # ── Update in-memory state so conversation context stays current ──
+    # ── Update conversation state so context stays current ──
     state = conversation_mgr.get_conversation(conversation_id)
     if state:
         state.add_message(role, content)
-        # Also update the Supabase conversations table
         conversation_mgr.update_conversation(conversation_id, state)
 
-    # Supabase CHECK constraint allows:
-    #   'question', 'answer', 'clarification', 'analysis_result'
-    _ROLE_TO_TYPE = {
-        "user": "question",
-        "assistant": "answer",
-        "system": "clarification",
-    }
+    db_type = message_type if message_type in _ALLOWED_TYPES else _ROLE_TO_TYPE.get(role, "question")
+    clean_id = normalise_conversation_id(conversation_id)
 
     try:
-        clean_id = (
-            conversation_id.replace("chat_", "")
-            if conversation_id.startswith("chat_")
-            else conversation_id
-        )
-
-        # Supabase column is UUID type — create a deterministic UUID
-        # from the session-id string so the same session always maps
-        # to the same UUID.
+        from ..database import models as db_models
+        if db_models.SessionLocal is None:
+            return
+        s = db_models.SessionLocal()
         try:
-            uuid.UUID(clean_id)          # already a valid UUID?
-            db_id = clean_id
-        except ValueError:
-            db_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_id))
-
-        # Map message_type to one the CHECK constraint accepts
-        db_type = _ROLE_TO_TYPE.get(role, message_type)
-        if db_type not in ("question", "answer", "clarification", "analysis_result"):
-            db_type = "question"         # safe fallback
-
-        row = {
-            "conversation_id": db_id,
-            "user_id": user_id,
-            "role": role,
-            "content": content,
-            "message_type": db_type,
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        if metadata:
-            row["metadata"] = metadata
-
-        supabase_client.table("conversation_messages").insert(row).execute()
-        print(f"✅ Saved {role} msg → {db_id} ({db_type})")
+            s.add(db_models.ConversationMessage(
+                conversation_id=clean_id,
+                user_id=user_id,
+                role=role,
+                content=content,
+                message_type=db_type,
+                message_metadata=metadata or None,
+            ))
+            s.commit()
+            print(f"✅ Saved {role} msg → {clean_id} ({db_type})")
+        except Exception:
+            s.rollback()
+            raise
+        finally:
+            s.close()
     except Exception as exc:
         print(f"⚠️  Failed to save conversation message: {exc}")
+
+
+def list_messages(conversation_id: str, limit: int = 500) -> list:
+    """Chronological message list for a conversation (My Analyses timeline)."""
+    from ..database import models as db_models
+    if db_models.SessionLocal is None:
+        return []
+    clean_id = normalise_conversation_id(conversation_id)
+    s = db_models.SessionLocal()
+    try:
+        rows = (
+            s.query(db_models.ConversationMessage)
+            .filter(db_models.ConversationMessage.conversation_id == clean_id)
+            .order_by(db_models.ConversationMessage.created_at.asc(),
+                      db_models.ConversationMessage.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "conversation_id": r.conversation_id,
+                "user_id": r.user_id,
+                "role": r.role,
+                "content": r.content,
+                "message_type": r.message_type,
+                "metadata": r.message_metadata,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    finally:
+        s.close()
 
 
 def build_conversation_context(session_id: str) -> str:

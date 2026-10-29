@@ -27,15 +27,42 @@ from ..services.conversation_service import (
     apply_decision_to_state,
 )
 from ..services.analysis_service import (
+    ANALYSIS_CREDIT_COST,
     build_analysis_request,
+    build_file_urls,
     create_processor,
     process_analysis_background,
 )
+from ..services import credits_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# Cache user_id → user_email for saving to Supabase
+# Cache user_id → user_email for persisting analyses
 _user_emails: dict[str, str] = {}
+
+
+def _check_credits_or_raise(user_id: str) -> None:
+    """Server-side guard: refuse to queue an analysis if the user is out of credits.
+
+    Anonymous / unknown users are allowed through (nothing to charge).
+    Any DB error is logged and ignored so that credit bookkeeping never blocks
+    an analysis unexpectedly.
+    """
+    if not user_id or user_id in ("unknown", "anonymous"):
+        return
+    try:
+        row = credits_service.ensure_user_credits(user_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"⚠️  Credit pre-check skipped ({exc})")
+        return
+    if not row:
+        return
+    credits = int(row.get("credits", 0) or 0)
+    if credits < ANALYSIS_CREDIT_COST:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient credits ({credits} left). Please purchase more credits to continue.",
+        )
 
 
 # ── POST /chat/start ─────────────────────────────────────────────────────────
@@ -238,7 +265,9 @@ async def analyze_from_conversation(
             "analysis_type": decision.intent.value,
             "location": decision.location_name,
             "message": "Analysis started in background.",
-            "files": _file_urls(bg_sid),
+            # Job is still running — only type-independent URLs are known yet.
+            # Poll /status/{session_id} for the final per-type file list.
+            "files": build_file_urls(bg_sid),
         }
 
     except HTTPException:
@@ -310,17 +339,6 @@ def _decision_to_response(session_id: str, d: RoutingDecision) -> dict:
     }
 
 
-def _file_urls(sid: str) -> dict:
-    return {
-        "preview_url": f"/results/{sid}/preview",
-        "map_url": f"/results/{sid}/map",
-        "chart_url": f"/results/{sid}/chart",
-        "animation_url": f"/results/{sid}/animation",
-        "download_url": f"/results/{sid}/download",
-        "metadata_url": f"/results/{sid}/metadata",
-    }
-
-
 async def _launch_analysis(
     background_tasks: BackgroundTasks,
     conv_session_id: str,
@@ -329,6 +347,7 @@ async def _launch_analysis(
     decision: RoutingDecision,
 ) -> str:
     """Create analysis request, processor, queue background work, return analysis session_id."""
+    _check_credits_or_raise(user_id)
     analysis_sid = _new_session_id()
 
     # Build location dict (lat/lon from decision, geocode if missing)

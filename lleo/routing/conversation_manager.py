@@ -4,7 +4,8 @@ Conversation Manager for Interactive Clarification
 Manages multi-turn conversations with users to gather missing information
 for satellite imagery analysis requests.
 
-Now uses Supabase for persistent storage across Cloud Run instances.
+State is persisted in Cloud SQL (``conversation_states`` table) so it survives
+across Cloud Run instances.
 """
 
 from typing import Dict, Any, Optional, List
@@ -89,105 +90,97 @@ class ConversationState:
 
 class ConversationManager:
     """
-    Manages conversations with Supabase persistence
+    Manages conversations with Cloud SQL persistence.
 
-    Stores conversation state in Supabase to maintain sessions across
-    multiple Cloud Run instances. Falls back to in-memory if Supabase unavailable.
+    The serialised ``ConversationState`` is stored in the ``conversation_states``
+    table so a multi-turn clarification can continue on any Cloud Run instance.
+    Falls back to the in-process cache if the database is not initialised
+    (e.g. unit tests).
     """
 
-    def __init__(self, supabase_client=None):
-        self.supabase = supabase_client
+    def __init__(self):
         self._local_cache: Dict[str, ConversationState] = {}
 
-        if self.supabase is None:
-            try:
-                from ..supabase_client import supabase_client as sb_client
-                self.supabase = sb_client
-                print("✅ ConversationManager using Supabase persistence")
-            except Exception as e:
-                print(f"⚠️  Supabase not available: {e}")
-                print("⚠️  Using in-memory storage (sessions won't persist)")
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _session():
+        from ..database import models as db_models
+        if db_models.SessionLocal is None:
+            return None
+        return db_models.SessionLocal()
 
+    def _persist(self, state: ConversationState, create: bool = False) -> None:
+        s = self._session()
+        if s is None:
+            return
+        try:
+            from ..database.models import ConversationStateRecord
+            row = s.get(ConversationStateRecord, state.session_id)
+            if row is None:
+                row = ConversationStateRecord(session_id=state.session_id, user_id=state.user_id)
+                s.add(row)
+            row.user_id = state.user_id
+            row.initial_query = state.initial_query
+            row.is_complete = bool(state.is_complete)
+            row.state = state.to_dict()
+            s.commit()
+            print(f"💾 {'Saved' if create else 'Updated'} conversation {state.session_id}")
+        except Exception as e:
+            s.rollback()
+            print(f"⚠️  Failed to persist conversation {state.session_id}: {e}")
+        finally:
+            s.close()
+
+    # ---------------------------------------------------------------- public API
     def create_conversation(self, session_id: str, user_id: str, query: str) -> ConversationState:
-        """Create conversation and save to Supabase"""
         state = ConversationState(session_id, user_id, query)
-
-        if self.supabase:
-            try:
-                data = {
-                    'session_id': state.session_id,
-                    'user_id': state.user_id,
-                    'initial_query': state.initial_query,
-                    'conversation_data': state.to_dict(),
-                    'analysis_type': state.analysis_type,
-                    'location': state.location,
-                    'start_year': state.start_year,
-                    'end_year': state.end_year,
-                    'specific_months': state.specific_months,
-                    'parameters': state.parameters,
-                    'is_complete': state.is_complete,
-                    'needs_clarification': state.needs_clarification
-                }
-                self.supabase.client.table('conversations').insert(data).execute()
-                print(f"💾 Saved conversation {session_id} to Supabase")
-            except Exception as e:
-                print(f"⚠️  Failed to save to Supabase: {e}")
-
         self._local_cache[session_id] = state
+        self._persist(state, create=True)
         return state
 
     def get_conversation(self, session_id: str) -> Optional[ConversationState]:
-        """Get conversation from Supabase or cache"""
         if session_id in self._local_cache:
             return self._local_cache[session_id]
 
-        if self.supabase:
-            try:
-                response = self.supabase.client.table('conversations').select('*').eq('session_id', session_id).single().execute()
-                if response.data:
-                    conversation_data = response.data.get('conversation_data', {})
-                    state = ConversationState.from_dict(conversation_data)
-                    self._local_cache[session_id] = state
-                    print(f"📥 Loaded conversation {session_id} from Supabase")
-                    return state
-            except Exception as e:
-                if 'No rows found' not in str(e) and 'PGRST116' not in str(e):
-                    print(f"⚠️  Failed to load from Supabase: {e}")
-        return None
+        s = self._session()
+        if s is None:
+            return None
+        try:
+            from ..database.models import ConversationStateRecord
+            row = s.get(ConversationStateRecord, session_id)
+            if row is None or not row.state:
+                return None
+            state = ConversationState.from_dict(row.state)
+            self._local_cache[session_id] = state
+            print(f"📥 Loaded conversation {session_id} from Cloud SQL")
+            return state
+        except Exception as e:
+            print(f"⚠️  Failed to load conversation {session_id}: {e}")
+            return None
+        finally:
+            s.close()
 
     def update_conversation(self, session_id: str, state: ConversationState):
-        """Update conversation in Supabase"""
         self._local_cache[session_id] = state
-
-        if self.supabase:
-            try:
-                data = {
-                    'conversation_data': state.to_dict(),
-                    'analysis_type': state.analysis_type,
-                    'location': state.location,
-                    'start_year': state.start_year,
-                    'end_year': state.end_year,
-                    'specific_months': state.specific_months,
-                    'parameters': state.parameters,
-                    'is_complete': state.is_complete,
-                    'needs_clarification': state.needs_clarification
-                }
-                self.supabase.client.table('conversations').update(data).eq('session_id', session_id).execute()
-                print(f"💾 Updated conversation {session_id}")
-            except Exception as e:
-                print(f"⚠️  Failed to update Supabase: {e}")
+        self._persist(state)
 
     def delete_conversation(self, session_id: str):
-        """Delete conversation from Supabase"""
-        if session_id in self._local_cache:
-            del self._local_cache[session_id]
-
-        if self.supabase:
-            try:
-                self.supabase.client.table('conversations').delete().eq('session_id', session_id).execute()
+        self._local_cache.pop(session_id, None)
+        s = self._session()
+        if s is None:
+            return
+        try:
+            from ..database.models import ConversationStateRecord
+            row = s.get(ConversationStateRecord, session_id)
+            if row is not None:
+                s.delete(row)
+                s.commit()
                 print(f"🗑️  Deleted conversation {session_id}")
-            except Exception as e:
-                print(f"⚠️  Failed to delete from Supabase: {e}")
+        except Exception as e:
+            s.rollback()
+            print(f"⚠️  Failed to delete conversation {session_id}: {e}")
+        finally:
+            s.close()
 
 
 # Global conversation manager instance
