@@ -322,8 +322,14 @@ async def get_user_gallery(
 
 # ── GET /results/{session_id}/preview ────────────────────────────────────────
 
+# NOTE: these artefact handlers are deliberately *sync* (`def`, not `async def`).
+# They do blocking Cloud SQL + GCS I/O; declaring them `async` ran that I/O on
+# the event loop, so a grid of 12-20 card thumbnails loaded one-after-another
+# and a single slow/failed download stalled every other request.  Plain `def`
+# makes FastAPI run each in the threadpool so they load in parallel.
+
 @router.get("/results/{session_id}/preview")
-async def get_preview(session_id: str, db: Session = Depends(get_db)):
+def get_preview(session_id: str, db: Session = Depends(get_db)):
     analysis = _get_record(session_id, db)
     if not analysis.thumbnail_path:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
@@ -333,7 +339,7 @@ async def get_preview(session_id: str, db: Session = Depends(get_db)):
 # ── GET /results/{session_id}/map ────────────────────────────────────────────
 
 @router.get("/results/{session_id}/map")
-async def get_map(session_id: str, db: Session = Depends(get_db)):
+def get_map(session_id: str, db: Session = Depends(get_db)):
     analysis = _get_record(session_id, db)
     path = (analysis.files or {}).get("map")
     if not path:
@@ -344,7 +350,7 @@ async def get_map(session_id: str, db: Session = Depends(get_db)):
 # ── GET /results/{session_id}/chart ──────────────────────────────────────────
 
 @router.get("/results/{session_id}/chart")
-async def get_chart(session_id: str, db: Session = Depends(get_db)):
+def get_chart(session_id: str, db: Session = Depends(get_db)):
     analysis = _get_record(session_id, db)
     path = (analysis.files or {}).get("chart") or (analysis.files or {}).get("charts")
     if not path:
@@ -355,7 +361,7 @@ async def get_chart(session_id: str, db: Session = Depends(get_db)):
 # ── GET /results/{session_id}/animation ──────────────────────────────────────
 
 @router.get("/results/{session_id}/animation")
-async def get_animation(session_id: str, db: Session = Depends(get_db)):
+def get_animation(session_id: str, db: Session = Depends(get_db)):
     analysis = _get_record(session_id, db)
     path = (analysis.files or {}).get("animation")
     if not path:
@@ -491,7 +497,7 @@ async def delete_analysis(
 # ── GET /files/{session_id}/{filename} ───────────────────────────────────────
 
 @router.get("/files/{session_id}/{filename}")
-async def serve_file(session_id: str, filename: str):
+def serve_file(session_id: str, filename: str):
     """Serve any artefact from GCS or local disk."""
     fm = services.file_manager
     cloud_path = f"analysis_results/{session_id}/{filename}"
@@ -499,12 +505,16 @@ async def serve_file(session_id: str, filename: str):
     if fm and fm.use_cloud:
         try:
             data = fm.get_file_bytes_from_cloud(f"gs://{fm.bucket_name}/{cloud_path}")
+            if not data:
+                raise HTTPException(status_code=404, detail="File not found")
             mime = _guess_mime(filename)
             return StreamingResponse(
                 io.BytesIO(data),
                 media_type=mime,
-                headers={"Cache-Control": "public, max-age=3600"},
+                headers=_artefact_headers(len(data)),
             )
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=404, detail=f"File not found: {exc}")
 
@@ -527,6 +537,19 @@ def _get_record(session_id: str, db: Session) -> AnalysisRecord:
     return rec
 
 
+# Artefacts are written once per session_id and only change via an explicit
+# admin regeneration, so a day of browser caching is safe and makes the card
+# grid feel instant on repeat visits.
+_ARTEFACT_MAX_AGE = 86400
+
+
+def _artefact_headers(length: Optional[int] = None) -> Dict[str, str]:
+    headers = {"Cache-Control": f"public, max-age={_ARTEFACT_MAX_AGE}"}
+    if length is not None:
+        headers["Content-Length"] = str(length)
+    return headers
+
+
 def _serve_cloud_or_local(path: str, media_type: str):
     """Return a streaming response from GCS or fall back to local file."""
     fm = services.file_manager
@@ -545,12 +568,12 @@ def _serve_cloud_or_local(path: str, media_type: str):
                 return StreamingResponse(
                     io.StringIO(data.decode("utf-8")),
                     media_type=media_type,
-                    headers={"Cache-Control": "public, max-age=3600"},
+                    headers=_artefact_headers(),
                 )
             return StreamingResponse(
                 io.BytesIO(data),
                 media_type=media_type,
-                headers={"Cache-Control": "public, max-age=3600"},
+                headers=_artefact_headers(len(data)),
             )
         except HTTPException:
             raise
@@ -558,7 +581,7 @@ def _serve_cloud_or_local(path: str, media_type: str):
             raise HTTPException(status_code=500, detail=f"Error serving file: {exc}")
 
     if os.path.exists(path):
-        return FileResponse(path, media_type=media_type, headers={"Cache-Control": "public, max-age=3600"})
+        return FileResponse(path, media_type=media_type, headers=_artefact_headers())
     raise HTTPException(status_code=404, detail="File not found")
 
 

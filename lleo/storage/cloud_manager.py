@@ -5,6 +5,7 @@ Handles file storage in Google Cloud Storage with local fallback
 
 import os
 import tempfile
+import time
 from typing import Optional
 from google.cloud import storage
 
@@ -205,13 +206,23 @@ class CloudFileManager:
                 print(f"❌ Error reading local file {cloud_path}: {e}")
                 return b""
 
-        try:
-            blob_name = cloud_path.replace(f"gs://{self.bucket_name}/", "")
-            blob = self.bucket.blob(blob_name)
-            return blob.download_as_bytes()
-        except Exception as e:
-            print(f"❌ Error downloading {cloud_path} as bytes: {e}")
-            return b""
+        blob_name = cloud_path.replace(f"gs://{self.bucket_name}/", "")
+        # Transient GCS/network errors (connection reset, 5xx, SSL EOF) used to
+        # surface as a 500 for a single card thumbnail, which the UI then
+        # latched as "failed" until a page reload.  Retry a couple of times
+        # with a short back-off before giving up.
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                blob = self.bucket.blob(blob_name)
+                return blob.download_as_bytes()
+            except Exception as e:
+                is_missing = type(e).__name__ == "NotFound" or "404" in str(e)
+                if is_missing or attempt == attempts:
+                    print(f"❌ Error downloading {cloud_path} as bytes (attempt {attempt}/{attempts}): {e}")
+                    return b""
+                time.sleep(0.25 * attempt)
+        return b""
 
     def file_exists(self, path: str) -> bool:
         """
