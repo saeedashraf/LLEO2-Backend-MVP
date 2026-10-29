@@ -143,6 +143,31 @@ def list_my_analyses(
     }
 
 
+@router.get("/analyses/{session_id}")
+def get_analysis(
+    session_id: str,
+    user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Single analysis for a deep link (/community/<id>, /my-analyses/<id>).
+
+    Visible when it is shared with the community, or when the caller is the
+    owner. Anything else is a 404 so private IDs can't be probed.
+    """
+    rec = db.get(AnalysisRecord, session_id)
+    is_owner = bool(user_id) and rec is not None and rec.user_id == user_id
+    if rec is None or not (rec.is_shared or is_owner):
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    liked: Optional[set] = None
+    if user_id:
+        liked = {
+            sid for (sid,) in db.query(AnalysisLike.session_id)
+            .filter(AnalysisLike.user_id == user_id, AnalysisLike.session_id == session_id)
+            .all()
+        }
+    return serialize_analysis(rec, liked)
+
+
 class ShareBody(BaseModel):
     user_id: str
     is_shared: bool

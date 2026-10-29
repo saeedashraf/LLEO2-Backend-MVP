@@ -119,6 +119,25 @@ def test_share_analysis_and_community_listing(client, db):
     assert client.get("/api/community").json()["total"] == 0
 
 
+def test_get_single_analysis_visibility(client, db):
+    _seed_analysis(db, "pub", user_id="u1", shared=True)
+    _seed_analysis(db, "priv", user_id="u1")
+
+    # shared → anyone can open the deep link
+    r = client.get("/api/analyses/pub")
+    assert r.status_code == 200 and r.json()["id"] == "pub"
+    assert r.json()["liked"] is None
+
+    # private → owner only
+    assert client.get("/api/analyses/priv").status_code == 404
+    assert client.get("/api/analyses/priv", params={"user_id": "u2"}).status_code == 404
+    r = client.get("/api/analyses/priv", params={"user_id": "u1"})
+    assert r.status_code == 200 and r.json()["is_shared"] is False
+    assert r.json()["liked"] is False
+
+    assert client.get("/api/analyses/nope").status_code == 404
+
+
 def test_share_whole_conversation(client, db):
     _seed_analysis(db, "c1", conv="conv-A")
     _seed_analysis(db, "c2", conv="conv-A")
