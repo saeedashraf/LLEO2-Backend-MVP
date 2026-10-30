@@ -8,6 +8,7 @@ GET    /api/analyses?user_id&page&per_page         — My Analyses (paginated)
 PATCH  /api/analyses/{session_id}/share            — toggle sharing for one analysis
 PATCH  /api/conversations/{conversation_id}/share  — toggle sharing for a whole conversation
 GET    /api/community?page&per_page[&user_id]      — shared analyses (+ which ones I liked)
+GET    /api/community/conversations/{id}[?user_id] — one shared conversation: analyses + chat messages
 POST   /api/analyses/{session_id}/like             — toggle like
 GET    /api/conversations/{conversation_id}/messages
 GET    /api/credits/{user_id}                      — balance (row auto-created)
@@ -239,6 +240,50 @@ def list_community(
         "per_page": per_page,
         "has_more": offset + len(rows) < total,
         "liked": sorted(liked),
+    }
+
+
+@router.get("/community/conversations/{conversation_id}")
+async def get_shared_conversation(
+    conversation_id: str,
+    user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Public view of a shared conversation: its shared analyses (oldest first)
+    plus the chat transcript, so the Community page can render the same
+    timeline the owner sees under My Analyses."""
+    cid = normalise_conversation_id(conversation_id)
+    rows = (
+        db.query(AnalysisRecord)
+        .filter(
+            AnalysisRecord.conversation_id == cid,
+            AnalysisRecord.is_shared.is_(True),
+            AnalysisRecord.artifacts_expired.is_(False),
+        )
+        .order_by(AnalysisRecord.created_at.asc())
+        .all()
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Shared conversation not found")
+    liked: set = set()
+    if user_id:
+        ids = [r.session_id for r in rows]
+        liked = {
+            sid for (sid,) in db.query(AnalysisLike.session_id)
+            .filter(AnalysisLike.user_id == user_id, AnalysisLike.session_id.in_(ids))
+            .all()
+        }
+    messages = await run_in_threadpool(list_messages, cid)
+    first = rows[0]
+    return {
+        "conversation_id": cid,
+        "analyses": [serialize_analysis(r, liked) for r in rows],
+        "messages": messages,
+        "first_query": first.query,
+        "location": first.location_name,
+        "user_name": display_name_for(first),
+        "created_at": _iso(first.created_at),
+        "count": len(rows),
     }
 
 

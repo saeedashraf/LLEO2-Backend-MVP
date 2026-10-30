@@ -150,6 +150,29 @@ def test_share_whole_conversation(client, db):
     assert ids == {"c1", "c2"}
 
 
+def test_shared_conversation_view(client, db):
+    _seed_analysis(db, "s1", shared=True, conv="conv-S")
+    _seed_analysis(db, "s2", shared=True, conv="conv-S")
+    _seed_analysis(db, "s3", shared=False, conv="conv-S")      # private → hidden
+    _seed_analysis(db, "s4", shared=True, conv="conv-S", artifacts_expired=True)
+    _seed_analysis(db, "t1", shared=False, conv="conv-T")
+    save_message("chat_conv-S", "u1", "user", "show ndvi", "question")
+    save_message("conv-S", "u1", "assistant", "done", "answer")
+
+    r = client.get("/api/community/conversations/chat_conv-S")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["conversation_id"] == "conv-S"
+    assert [a["id"] for a in body["analyses"]] == ["s1", "s2"]
+    assert body["count"] == 2
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+    assert body["first_query"] and body["user_name"] == "u1"
+
+    # nothing shared in that conversation → 404
+    assert client.get("/api/community/conversations/conv-T").status_code == 404
+    assert client.get("/api/community/conversations/nope").status_code == 404
+
+
 def test_author_name_and_expired_artifacts(client, db, monkeypatch):
     _seed_analysis(db, "p1", user_id="u1", shared=True, author_name="Sureal.ai")
     _seed_analysis(db, "p2", user_id="u2", shared=True)
