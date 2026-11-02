@@ -29,9 +29,10 @@ import json
 import math
 import os
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ee
 from PIL import Image, ImageDraw, ImageFont
@@ -43,8 +44,21 @@ from lleo.core.exceptions import ProcessorException, ValidationException
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_DIMENSION = 1024               # per-frame PNG edge in pixels
+DEFAULT_DIMENSION = 768                # per-frame PNG edge in pixels (was 1024:
+                                       # ~45 % fewer pixels → faster download,
+                                       # quantise, encode and upload)
 MIN_DIMENSION = 512
+MAX_DIMENSION = 1024
+
+# Frame budget. Above this many months we composite several months per
+# frame (e.g. 5 years → 30 bi-monthly frames instead of 60) which keeps
+# render time and GIF size bounded.
+MAX_FRAMES = 36
+
+DOWNLOAD_RETRIES = 4                   # GEE thumb fetch retries (503/5xx/timeouts)
+DOWNLOAD_TIMEOUT_S = 90
+UPLOAD_RETRIES = 3                     # GCS upload attempts before failing the job
+GIF_COLORS = 256
 
 DEFAULT_HALF_SIZE_M = 5_000            # default 10 × 10 km box
 MIN_HALF_SIZE_M = 500                  # 1 × 1 km
@@ -57,7 +71,7 @@ S2_VIS_BANDS = ["B4", "B3", "B2"]      # red, green, blue
 S2_VIS_MIN = 0
 S2_VIS_MAX = 3000                      # consistent stretch across all frames
 
-PARALLEL_DOWNLOADS = 8                 # concurrent frame downloads
+PARALLEL_DOWNLOADS = 12                # concurrent frame downloads
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
@@ -88,6 +102,51 @@ def _mask_s2_clouds(img: ee.Image) -> ee.Image:
 
 def _month_label(year: int, month: int) -> str:
     return f"{calendar.month_abbr[month]} {year}"
+
+
+def _add_months(year: int, month: int, n: int) -> Tuple[int, int]:
+    """Return (year, month) that is ``n`` months after (year, month)."""
+    idx = (year * 12 + (month - 1)) + n
+    return idx // 12, idx % 12 + 1
+
+
+def _period_label(year: int, month: int, months: int) -> str:
+    """Label for a frame spanning ``months`` months starting at year/month."""
+    if months <= 1:
+        return _month_label(year, month)
+    ey, em = _add_months(year, month, months - 1)
+    if ey == year:
+        return f"{calendar.month_abbr[month]}–{calendar.month_abbr[em]} {year}"
+    return f"{_month_label(year, month)} – {_month_label(ey, em)}"
+
+
+def _plan_periods(
+    start_year: int,
+    end_year: int,
+    start_month: int,
+    end_month: int,
+    max_frames: int = MAX_FRAMES,
+) -> List[Dict[str, int]]:
+    """Split the requested range into frame periods.
+
+    Returns a list of ``{year, month, months}`` dicts where ``months`` is the
+    number of calendar months composited into that frame.  If the range has
+    more than ``max_frames`` months, consecutive months are grouped so the
+    total frame count stays ≤ ``max_frames``.
+    """
+    total = (end_year * 12 + end_month) - (start_year * 12 + start_month) + 1
+    if total <= 0:
+        return []
+    stride = max(1, math.ceil(total / max_frames))
+    periods: List[Dict[str, int]] = []
+    y, m = start_year, start_month
+    remaining = total
+    while remaining > 0:
+        span = min(stride, remaining)
+        periods.append({"year": y, "month": m, "months": span})
+        y, m = _add_months(y, m, span)
+        remaining -= span
+    return periods
 
 
 # ── Font loading (best-effort cross-platform) ────────────────────────────────
@@ -232,7 +291,32 @@ def _annotate_frame(
 def _pick_dimension(num_frames: int, requested: int = DEFAULT_DIMENSION) -> int:
     """We download per-frame so there is no global pixel budget; this just clamps
     the requested edge to a sane range."""
-    return max(MIN_DIMENSION, min(int(requested), 2048))
+    return max(MIN_DIMENSION, min(int(requested), MAX_DIMENSION))
+
+
+def _is_retryable_http(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (429, 500, 502, 503, 504)
+    # URLError (DNS / connection reset), socket timeouts, incomplete reads
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError, EOFError))
+
+
+def _download_with_retry(make_url, attempts: int = DOWNLOAD_RETRIES) -> bytes:
+    """Fetch a GEE thumbnail, regenerating the URL and backing off on 5xx/timeouts."""
+    delay = 2.0
+    last: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            url = make_url()
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as r:
+                return r.read()
+        except Exception as exc:  # noqa: BLE001 — classify below
+            last = exc
+            if attempt == attempts or not _is_retryable_http(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 20.0)
+    raise last  # type: ignore[misc]  # pragma: no cover
 
 
 # ── Processor ────────────────────────────────────────────────────────────────
@@ -362,35 +446,45 @@ class VideoAnimationProcessor(BaseProcessor):
                 f"Downloading {num_frames} frames at {dimension}px (parallel x{PARALLEL_DOWNLOADS})…",
                 session_id=sid,
             )
+            # Frames are stored already quantised to a 256-colour palette so
+            # that the (slow, single-threaded) palette search happens inside
+            # the worker threads instead of serially during GIF encoding.
             pil_frames: List[Image.Image] = [None] * num_frames  # type: ignore[list-item]
+            rgb_last: List[Optional[Image.Image]] = [None]
             per_frame_summary: List[Dict[str, Any]] = [None] * num_frames  # type: ignore[list-item]
+            thumb_params = {
+                "dimensions": dimension,
+                "region": aoi,
+                "format": "png",
+                "crs": "EPSG:3857",
+            }
 
             def _fetch_one(idx: int) -> None:
                 spec = frame_specs[idx]
                 count = int(scene_counts[idx])
-                label = _month_label(spec["year"], spec["month"])
+                label = spec["label"]
                 if count == 0:
                     # No clear scenes — make a black placeholder rather than failing
                     img = Image.new("RGB", (dimension, dimension), (0, 0, 0))
                 else:
-                    url = spec["image"].getThumbURL({
-                        "dimensions": dimension,
-                        "region": aoi,
-                        "format": "png",
-                        "crs": "EPSG:3857",
-                    })
-                    with urllib.request.urlopen(url, timeout=120) as r:
-                        raw = r.read()
+                    raw = _download_with_retry(
+                        lambda: spec["image"].getThumbURL(thumb_params)
+                    )
                     img = Image.open(io.BytesIO(raw)).convert("RGB")
 
                 annotated = _annotate_frame(
                     img, label, frame_bbox, idx + 1, num_frames,
                 )
-                pil_frames[idx] = annotated
+                if idx == num_frames - 1:
+                    rgb_last[0] = annotated
+                pil_frames[idx] = annotated.quantize(
+                    colors=GIF_COLORS, method=Image.Quantize.MEDIANCUT,
+                )
                 per_frame_summary[idx] = {
                     "frame": idx + 1,
                     "year": spec["year"],
                     "month": spec["month"],
+                    "months_composited": spec["months"],
                     "label": label,
                     "scenes_composited": count,
                     "had_data": count > 0,
@@ -410,17 +504,20 @@ class VideoAnimationProcessor(BaseProcessor):
             gif_path = os.path.join(tmp_dir, "animation.gif")
             preview_path = os.path.join(tmp_dir, "preview.png")
             self.log_info("Stitching GIF…", session_id=sid)
+            t_enc = time.time()
             pil_frames[0].save(
                 gif_path,
                 save_all=True,
                 append_images=pil_frames[1:],
                 duration=int(1000 / fps),
                 loop=0,
-                optimize=True,
+                optimize=False,   # frames are pre-quantised; optimize=True only
+                                  # re-runs the palette search per frame.
             )
-            pil_frames[-1].save(preview_path)
+            (rgb_last[0] or pil_frames[-1].convert("RGB")).save(preview_path)
             self.log_info(
-                f"GIF: {os.path.getsize(gif_path) / 1024 / 1024:.1f} MB",
+                f"GIF: {os.path.getsize(gif_path) / 1024 / 1024:.1f} MB "
+                f"(encode {time.time() - t_enc:.1f}s)",
                 session_id=sid,
             )
 
@@ -442,7 +539,12 @@ class VideoAnimationProcessor(BaseProcessor):
                 "satellite": "Sentinel-2 SR Harmonized (COPERNICUS/S2_SR_HARMONIZED)",
                 "resolution_native_m": 10,
                 "rendered_dimension_px": dimension,
-                "compositing_method": "monthly median + SCL cloud/shadow/cirrus mask",
+                "months_per_frame": frame_specs[0]["months"],
+                "compositing_method": (
+                    "monthly median + SCL cloud/shadow/cirrus mask"
+                    if frame_specs[0]["months"] == 1 else
+                    f"{frame_specs[0]['months']}-month median + SCL cloud/shadow/cirrus mask"
+                ),
                 "date_range": (
                     f"{start_year}-{start_month:02d} to "
                     f"{end_year}-{end_month:02d}"
@@ -460,27 +562,32 @@ class VideoAnimationProcessor(BaseProcessor):
                 json.dump(summary, f, indent=2)
 
             # ── Upload to GCS ───────────────────────────────────────────────
+            # Uploads are verified: `save_file_to_cloud` returns the *local*
+            # path when the upload fails, and persisting a `/tmp/...` path
+            # (which vanishes with the container) is exactly what produced
+            # the "animation not found" errors.  We retry, and if the GIF
+            # still cannot be stored we fail the job instead of lying.
             outputs: Dict[str, str] = {}
-            if hasattr(self, "file_manager") and self.file_manager:
-                try:
-                    outputs["animation"] = self.file_manager.save_file_to_cloud(
-                        gif_path, f"analysis_results/{sid}/animation.gif",
-                    )
-                    outputs["preview"] = self.file_manager.save_file_to_cloud(
-                        preview_path, f"analysis_results/{sid}/preview.png",
-                    )
-                    outputs["charts"] = self.file_manager.save_file_to_cloud(
-                        preview_path, f"analysis_results/{sid}/first_frame.png",
-                    )
-                    outputs["summary"] = self.file_manager.save_file_to_cloud(
-                        summary_path, f"analysis_results/{sid}/summary.json",
-                    )
-                    self.log_info("Uploaded animation + preview + summary to GCS", session_id=sid)
-                except Exception as exc:
-                    self.log_error(f"GCS upload failed: {exc}", session_id=sid)
-                    outputs["animation"] = gif_path
-                    outputs["preview"] = preview_path
-                    outputs["summary"] = summary_path
+            fm = getattr(self, "file_manager", None)
+            if fm:
+                t_up = time.time()
+                outputs["animation"] = self._upload_verified(
+                    fm, gif_path, f"analysis_results/{sid}/animation.gif", sid,
+                )
+                outputs["preview"] = self._upload_verified(
+                    fm, preview_path, f"analysis_results/{sid}/preview.png", sid,
+                )
+                outputs["charts"] = self._upload_verified(
+                    fm, preview_path, f"analysis_results/{sid}/first_frame.png", sid,
+                )
+                outputs["summary"] = self._upload_verified(
+                    fm, summary_path, f"analysis_results/{sid}/summary.json", sid,
+                )
+                self.log_info(
+                    f"Uploaded animation + preview + summary to GCS "
+                    f"({time.time() - t_up:.1f}s)",
+                    session_id=sid,
+                )
             else:
                 outputs["animation"] = gif_path
                 outputs["preview"] = preview_path
@@ -517,6 +624,35 @@ class VideoAnimationProcessor(BaseProcessor):
             self.log_error(f"Unexpected error: {exc}", session_id=sid)
             raise ProcessorException(f"Video animation failed: {exc}")
 
+    # ── Storage helper ───────────────────────────────────────────────────────
+
+    def _upload_verified(self, fm, local_path: str, cloud_path: str, sid: str) -> str:
+        """Upload via the file manager and *verify* the result.
+
+        In cloud mode a non-``gs://`` return value means the upload failed
+        (CloudFileManager swallows the exception).  Retry with back-off and
+        raise ProcessorException if it never succeeds.  In local mode the
+        local path is the expected result.
+        """
+        cloud_mode = bool(getattr(fm, "use_cloud", False))
+        delay = 3.0
+        for attempt in range(1, UPLOAD_RETRIES + 1):
+            result = fm.save_file_to_cloud(local_path, cloud_path)
+            if not cloud_mode or (isinstance(result, str) and result.startswith("gs://")):
+                return result
+            self.log_warning(
+                f"Upload of {os.path.basename(local_path)} failed "
+                f"(attempt {attempt}/{UPLOAD_RETRIES})",
+                session_id=sid,
+            )
+            if attempt < UPLOAD_RETRIES:
+                time.sleep(delay)
+                delay *= 2
+        raise ProcessorException(
+            f"Could not store {os.path.basename(local_path)} in cloud storage "
+            f"after {UPLOAD_RETRIES} attempts."
+        )
+
     # ── GEE pipeline ─────────────────────────────────────────────────────────
 
     def _build_monthly_specs(
@@ -527,7 +663,11 @@ class VideoAnimationProcessor(BaseProcessor):
         start_month: int,
         end_month: int,
     ) -> List[Dict[str, Any]]:
-        """Build a {year, month, image, count} spec per calendar month."""
+        """Build a {year, month, months, label, image, count} spec per frame.
+
+        Each frame is a median composite over ``months`` calendar months
+        (1 for ranges ≤ MAX_FRAMES months, more for longer ranges).
+        """
         base = (
             ee.ImageCollection(S2_COLLECTION)
             .filterBounds(aoi)
@@ -536,23 +676,23 @@ class VideoAnimationProcessor(BaseProcessor):
         )
 
         specs: List[Dict[str, Any]] = []
-        for year in range(start_year, end_year + 1):
-            m_start = start_month if year == start_year else 1
-            m_end = end_month if year == end_year else 12
-            for month in range(m_start, m_end + 1):
-                period_start = ee.Date.fromYMD(year, month, 1)
-                period_end = period_start.advance(1, "month")
-                monthly = base.filterDate(period_start, period_end)
-                composite = ee.Image(0).blend(monthly.median())
-                rgb = composite.visualize(
-                    bands=S2_VIS_BANDS, min=S2_VIS_MIN, max=S2_VIS_MAX,
-                )
-                specs.append({
-                    "year": year,
-                    "month": month,
-                    "image": rgb,
-                    "count": monthly.size(),  # ee.Number, evaluated later in batch
-                })
+        for period in _plan_periods(start_year, end_year, start_month, end_month):
+            year, month, months = period["year"], period["month"], period["months"]
+            period_start = ee.Date.fromYMD(year, month, 1)
+            period_end = period_start.advance(months, "month")
+            subset = base.filterDate(period_start, period_end)
+            composite = ee.Image(0).blend(subset.median())
+            rgb = composite.visualize(
+                bands=S2_VIS_BANDS, min=S2_VIS_MIN, max=S2_VIS_MAX,
+            )
+            specs.append({
+                "year": year,
+                "month": month,
+                "months": months,
+                "label": _period_label(year, month, months),
+                "image": rgb,
+                "count": subset.size(),  # ee.Number, evaluated later in batch
+            })
         return specs
 
     # ── Capabilities ─────────────────────────────────────────────────────────
@@ -570,12 +710,15 @@ class VideoAnimationProcessor(BaseProcessor):
                 "is included in the download bundle."
             ),
             "satellite": "Sentinel-2 (COPERNICUS/S2_SR_HARMONIZED)",
-            "resolution": "10 m native, up to 1024 px rendered",
+            "resolution": f"10 m native, up to {MAX_DIMENSION} px rendered",
             "data_provider": "Copernicus / Google Earth Engine",
             "min_year": 2015,
             "max_time_range_years": 5,
             "max_area_km": MAX_HALF_SIZE_M * 2 / 1000,
-            "temporal_resolution": "Monthly (median composite)",
+            "temporal_resolution": (
+                f"Monthly (median composite); ranges longer than {MAX_FRAMES} "
+                f"months are grouped so at most {MAX_FRAMES} frames are rendered"
+            ),
             "cost": "free",
             "outputs": [
                 "Animated GIF timelapse (locally stitched, annotated)",
