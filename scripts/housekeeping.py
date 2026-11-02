@@ -1,5 +1,8 @@
 """One-shot production housekeeping. Usage: python scripts/housekeeping.py <step>
-steps: prune-dry | prune | regen | community"""
+steps: stats | prune-dry | prune | restore-dry | restore | regen | community
+
+Previews never expire: `restore` clears false-positive `artifacts_expired`
+flags and rebuilds missing preview.png files from the stored location."""
 import json
 import sys
 
@@ -15,7 +18,16 @@ def post(path, body):
 
 
 step = sys.argv[1]
-if step == "prune-dry":
+if step == "stats":
+    r = requests.get(f"{API}/api/admin/stats", headers={"X-Admin-Key": admin_key()}, timeout=60)
+    print(r.status_code, json.dumps(r.json(), indent=2))
+elif step in ("restore-dry", "restore"):
+    j = post("/api/admin/restore-expired-artifacts",
+             {"dry_run": step == "restore-dry", "regenerate": True, "limit": 3000})
+    print({k: v for k, v in j.items() if not k.endswith("_ids")})
+    for k in ("unflagged_ids", "regenerated_ids", "still_missing_ids", "error_ids"):
+        print(k, (j.get(k) or [])[:10])
+elif step == "prune-dry":
     j = post("/api/admin/prune-expired-artifacts", {"dry_run": True, "only_shared": False, "limit": 3000})
     print({k: v for k, v in j.items() if k not in ("expired_session_ids", "sessions", "expired")})
     ids = j.get("expired_session_ids") or j.get("sessions") or j.get("expired") or []

@@ -71,7 +71,12 @@ def display_name_for(rec: AnalysisRecord) -> Optional[str]:
 def serialize_analysis(rec: AnalysisRecord, liked_ids: Optional[set] = None) -> Dict[str, Any]:
     """AnalysisRecord → the JSON shape the React `Analysis` type expects."""
     expired = bool(getattr(rec, "artifacts_expired", False))
-    urls = {} if expired else build_file_urls(rec.session_id, rec.files or {})
+    if expired:
+        # Map/charts may be gone, but the preview endpoint self-heals (it is
+        # rebuilt from the stored location), so always advertise it.
+        urls = {"preview_url": f"/results/{rec.session_id}/preview"}
+    else:
+        urls = build_file_urls(rec.session_id, rec.files or {})
     return {
         "id": rec.session_id,
         "session_id": rec.session_id,

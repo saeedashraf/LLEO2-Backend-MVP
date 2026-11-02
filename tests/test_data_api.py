@@ -56,11 +56,11 @@ def _seed_analysis(SessionLocal, sid, user_id="u1", shared=False, conv="conv-1",
         query=f"query {sid}",
         analysis_type="vegetation_index",
         location_name="Tehran",
-        location_lat=35.7,
-        location_lng=51.4,
+        location_lat=extra.pop("location_lat", 35.7),
+        location_lng=extra.pop("location_lng", 51.4),
         start_year=2020,
         end_year=2023,
-        files={"map": "/results/%s/map.html" % sid, "charts": "/results/%s/charts.png" % sid},
+        files=extra.pop("files", {"map": "/results/%s/map.html" % sid, "charts": "/results/%s/charts.png" % sid}),
         conversation_id=conv,
         is_shared=shared,
         shared_at=datetime.utcnow() if shared else None,
@@ -174,9 +174,10 @@ def test_shared_conversation_view(client, db):
 
 
 def test_author_name_and_expired_artifacts(client, db, monkeypatch):
-    _seed_analysis(db, "p1", user_id="u1", shared=True, author_name="Sureal.ai")
-    _seed_analysis(db, "p2", user_id="u2", shared=True)
-    _seed_analysis(db, "p3", user_id="u3", shared=True, artifacts_expired=True)
+    old = datetime.utcnow() - timedelta(days=2)
+    _seed_analysis(db, "p1", user_id="u1", shared=True, author_name="Sureal.ai", created_at=old)
+    _seed_analysis(db, "p2", user_id="u2", shared=True, created_at=old)
+    _seed_analysis(db, "p3", user_id="u3", shared=True, artifacts_expired=True, created_at=old)
 
     comm = client.get("/api/community").json()
     by_id = {it["id"]: it for it in comm["items"]}
@@ -187,7 +188,9 @@ def test_author_name_and_expired_artifacts(client, db, monkeypatch):
 
     mine = client.get("/api/analyses", params={"user_id": "u3"}).json()["items"][0]
     assert mine["artifacts_expired"] is True
-    assert mine["thumbnail_url"] is None and mine["map_url"] is None
+    assert mine["map_url"] is None
+    # preview endpoint self-heals, so it is always advertised
+    assert mine["thumbnail_url"].endswith("/results/p3/preview")
 
     # admin publish endpoint: share + stamp author
     from lleo.routers import admin as admin_router
@@ -200,9 +203,10 @@ def test_author_name_and_expired_artifacts(client, db, monkeypatch):
     assert r.status_code == 200 and r.json()["updated"] == 1 and r.json()["missing"] == ["zzz"]
     assert {it["user_name"] for it in client.get("/api/community").json()["items"]} == {"Sureal.ai"}
 
-    # prune: file manager says nothing exists → all flagged (dry-run first)
+    # prune: file manager says only p1's map exists → p2 flagged (dry-run first)
     from lleo.config import services
     class _FM:
+        use_cloud = False
         def file_exists(self, p):
             return p.endswith("p1/map.html")
     monkeypatch.setattr(services, "file_manager", _FM())
@@ -212,6 +216,101 @@ def test_author_name_and_expired_artifacts(client, db, monkeypatch):
     r = ac.post("/api/admin/prune-expired-artifacts", json={"dry_run": False}, headers={"X-Admin-Key": "k"})
     assert r.json()["expired"] == 1
     assert [it["id"] for it in client.get("/api/community").json()["items"]] == ["p1"]
+
+
+def test_prune_is_conservative(client, db, monkeypatch):
+    """Rows are never flagged when they are fresh, have no artefact paths, or
+    the storage check itself fails (e.g. GCS unavailable)."""
+    old = datetime.utcnow() - timedelta(days=2)
+    _seed_analysis(db, "fresh", shared=True)                             # < 6 h old
+    _seed_analysis(db, "nopaths", shared=True, files={}, created_at=old)  # nothing to verify
+    _seed_analysis(db, "gcs", shared=True, created_at=old,
+                   files={"map": "gs://bucket/analysis_results/gcs/map.html"})
+    _seed_analysis(db, "gone", shared=True, created_at=old)
+
+    from lleo.config import services
+    from lleo.routers import admin as admin_router
+    class _FM:                       # GCS client *not* initialised
+        use_cloud = False
+        bucket = None
+        bucket_name = "bucket"
+        def file_exists(self, p):
+            return False
+    monkeypatch.setattr(services, "file_manager", _FM())
+    monkeypatch.setenv("ADMIN_KEY", "k")
+    app = FastAPI()
+    app.include_router(admin_router.router)
+    ac = TestClient(app)
+
+    r = ac.post("/api/admin/prune-expired-artifacts", json={"dry_run": False}, headers={"X-Admin-Key": "k"})
+    body = r.json()
+    assert body["expired_ids"] == ["gone"]
+    assert body["error_ids"] == ["gcs"]          # could not verify → untouched
+    assert body["skipped"] == 2                  # fresh + nopaths
+    ids = {it["id"] for it in client.get("/api/community").json()["items"]}
+    assert ids == {"fresh", "nopaths", "gcs"}
+
+
+def test_restore_expired_artifacts(client, db, monkeypatch):
+    old = datetime.utcnow() - timedelta(days=2)
+    # false positive: files exist again
+    _seed_analysis(db, "back", shared=True, artifacts_expired=True, created_at=old,
+                   thumbnail_path="/results/back/preview.png")
+    # preview gone but location known → regenerated
+    _seed_analysis(db, "rebuild", shared=True, artifacts_expired=True, created_at=old)
+    # nothing left and no location → stays flagged
+    _seed_analysis(db, "dead", shared=True, artifacts_expired=True, created_at=old,
+                   location_lat=None, location_lng=None, coordinates=None)
+
+    from lleo.config import services
+    from lleo.routers import admin as admin_router
+    from lleo.services import preview_service
+
+    uploaded = []
+    class _FM:
+        use_cloud = True
+        bucket = object()
+        bucket_name = "bucket"
+        def file_exists(self, p):
+            return p.startswith("/results/back/")
+        def save_file_to_cloud(self, local, cloud):
+            uploaded.append(cloud)
+            return f"gs://bucket/{cloud}"
+    monkeypatch.setattr(services, "file_manager", _FM())
+
+    def fake_thumb(location, analysis_type, thumbnail_path, start_year=None, end_year=None):
+        with open(thumbnail_path, "wb") as f:
+            f.write(b"png")
+        return True
+    import lleo.utils.thumbnail as thumb_mod
+    monkeypatch.setattr(thumb_mod, "create_satellite_thumbnail", fake_thumb)
+
+    monkeypatch.setenv("ADMIN_KEY", "k")
+    app = FastAPI()
+    app.include_router(admin_router.router)
+    ac = TestClient(app)
+
+    # dry run → nothing persisted
+    r = ac.post("/api/admin/restore-expired-artifacts", json={"dry_run": True}, headers={"X-Admin-Key": "k"})
+    assert r.status_code == 200
+    assert r.json()["unflagged_ids"] == ["back"] and r.json()["regenerated_ids"] == ["rebuild"]
+    assert client.get("/api/community").json()["total"] == 0
+
+    r = ac.post("/api/admin/restore-expired-artifacts", json={"dry_run": False}, headers={"X-Admin-Key": "k"})
+    body = r.json()
+    assert body["unflagged_ids"] == ["back"]
+    assert body["regenerated_ids"] == ["rebuild"]
+    assert body["still_missing_ids"] == ["dead"]
+    assert uploaded == ["analysis_results/rebuild/preview.png"]
+
+    comm = client.get("/api/community").json()
+    assert {it["id"] for it in comm["items"]} == {"back", "rebuild"}
+    s = db()
+    rec = s.query(AnalysisRecord).filter_by(session_id="rebuild").one()
+    assert rec.thumbnail_path == "gs://bucket/analysis_results/rebuild/preview.png"
+    assert rec.files["preview"] == rec.thumbnail_path and rec.artifacts_expired is False
+    s.close()
+    assert preview_service.artifact_paths(rec)[0] == rec.thumbnail_path
 
 
 def test_like_toggle_updates_counter_and_liked_flag(client, db):

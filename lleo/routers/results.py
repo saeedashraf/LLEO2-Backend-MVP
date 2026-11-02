@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from ..config import services
 from ..database.models import AnalysisRecord, get_db
 from ..models.routing import RoutingDecision
+from ..services import preview_service
 from ..services.router_service import route_query
 from ..services.geocoding_service import build_location_from_decision, flatten_location
 from ..services.analysis_service import (
@@ -330,10 +331,37 @@ async def get_user_gallery(
 
 @router.get("/results/{session_id}/preview")
 def get_preview(session_id: str, db: Session = Depends(get_db)):
+    """Serve ``preview.png`` — and self-heal when it is missing.
+
+    Previews never expire: if the stored thumbnail is absent (never written,
+    deleted, or the row was flagged ``artifacts_expired``) it is rebuilt from
+    the location in Cloud SQL, uploaded back to GCS and the flag cleared, so
+    the next request (and the card grid) gets a real image again.
+    """
     analysis = _get_record(session_id, db)
-    if not analysis.thumbnail_path:
+    fm = services.file_manager
+
+    if analysis.thumbnail_path:
+        try:
+            return _serve_cloud_or_local(analysis.thumbnail_path, "image/png")
+        except HTTPException as exc:
+            if exc.status_code != 404 or fm is None:
+                raise
+            # fall through → regenerate
+
+    if fm is None:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
-    return _serve_cloud_or_local(analysis.thumbnail_path, "image/png")
+
+    try:
+        new_path = preview_service.regenerate_preview(analysis, fm)
+        if new_path:
+            db.commit()
+    except Exception as exc:  # never let a rebuild error mask the 404
+        print(f"⚠️  preview self-heal failed for {session_id}: {exc}")
+        new_path = None
+    if not new_path:
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return _serve_cloud_or_local(new_path, "image/png")
 
 
 # ── GET /results/{session_id}/map ────────────────────────────────────────────
