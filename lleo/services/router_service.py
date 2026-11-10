@@ -51,6 +51,17 @@ Your ONLY job is to read a user's message and return ONE JSON object.
      set start_month and end_month accordingly (3-6, 1-8, 5-10). Do NOT leave them null
      when the user explicitly says month names. This is especially important for
      video_animation requests where the month range bounds the timelapse.
+   - **Temporal resolution** (`temporal_resolution`): set it ONLY when the user asks for
+     a cadence of time steps: "weekly", "every week", "week by week" → "weekly";
+     "daily", "day by day", "each day", "per acquisition" → "daily"; "monthly",
+     "every month", "month by month" → "monthly"; "seasonal", "per season" → "seasonal";
+     "yearly", "annual", "year by year" → "annual". Otherwise null.
+   - **Exact dates** (`start_date`, `end_date`, YYYY-MM-DD): fill them when the user names
+     specific days ("from 10 March 2025 to 2 April 2025", "since 26 August 2026").
+     Also fill start_year/end_year/start_month/end_month consistently from those dates.
+   - **Event date** (`event_date`, YYYY-MM-DD): when the question is about the impact of
+     a dated event ("after the 26 August 2026 flood", "since the dam broke on 3 May 2024"),
+     put that date here and set start_date to it unless the user asks for an earlier start.
 
 4. Fill any analysis-specific parameters (pollutants, water_indicators, etc.).
 
@@ -136,7 +147,7 @@ keep the same intent and location, just fill in the parameters.
 JSON_INSTRUCTION = f"""\
 Respond with ONLY a JSON object. No markdown, no explanation, nothing else.
 
-Use exactly these 18 keys (null for unknown, [] for empty arrays):
+Use exactly these 22 keys (null for unknown, [] for empty arrays):
 
 {{
   "intent": "weather_forecast",
@@ -148,6 +159,10 @@ Use exactly these 18 keys (null for unknown, [] for empty arrays):
   "end_year": {date.today().year},
   "start_month": null,
   "end_month": null,
+  "temporal_resolution": null,
+  "start_date": null,
+  "end_date": null,
+  "event_date": null,
   "business_type": null,
   "keyword": null,
   "radius": 2000,
@@ -160,7 +175,9 @@ Use exactly these 18 keys (null for unknown, [] for empty arrays):
 }}
 
 IMPORTANT:
-- ALL 18 keys must be present in your response.
+- ALL 22 keys must be present in your response.
+- temporal_resolution: one of "daily", "weekly", "monthly", "seasonal", "annual" or null.
+- start_date / end_date / event_date: "YYYY-MM-DD" strings or null.
 - latitude and longitude: use decimal degrees. You know them for all cities.
 - needs_clarification: empty [] when you have everything needed.
 - general_answer: fill for general_question intent — this includes both casual questions
@@ -267,6 +284,8 @@ async def route_query(
         print(
             f"      time={decision.start_year}→{decision.end_year}  "
             f"months={decision.start_month}→{decision.end_month}  "
+            f"resolution={decision.temporal_resolution}  "
+            f"dates={decision.start_date}→{decision.end_date}  event={decision.event_date}  "
             f"clarify={decision.needs_clarification}"
         )
 
@@ -329,6 +348,7 @@ def _parse_json(raw: str) -> dict:
     for key in (
         "intent", "confidence", "location_name",
         "clarification_message", "general_answer",
+        "temporal_resolution", "start_date", "end_date", "event_date",
     ):
         m2 = re.search(rf'"{key}"\s*:\s*"([^"]*)"', raw)
         if m2:
@@ -374,6 +394,7 @@ def _merge_prior(
     FIELDS = [
         "location_name", "latitude", "longitude",
         "start_year", "end_year", "start_month", "end_month",
+        "temporal_resolution", "start_date", "end_date", "event_date",
         "business_type", "keyword",
         "pollutants", "water_indicators", "vegetation_index_type",
     ]

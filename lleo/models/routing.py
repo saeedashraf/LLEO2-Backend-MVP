@@ -82,6 +82,58 @@ class RoutingDecision(BaseModel):
         description="End month (1-12) if user specified a sub-annual range."
     )
 
+    # --- Temporal resolution (how fine the time steps should be) ---
+    temporal_resolution: Optional[str] = Field(
+        default=None,
+        description="daily | weekly | monthly | seasonal | annual. Only set when the "
+                    "user asks for a cadence (e.g. 'weekly', 'every month', 'day by day')."
+    )
+    start_date: Optional[str] = Field(
+        default=None,
+        description="Exact start date YYYY-MM-DD when the user gives a specific date."
+    )
+    end_date: Optional[str] = Field(
+        default=None,
+        description="Exact end date YYYY-MM-DD when the user gives a specific date."
+    )
+    event_date: Optional[str] = Field(
+        default=None,
+        description="YYYY-MM-DD of an event the user refers to (flood, landslide, spill) "
+                    "when the question is about before/after that event."
+    )
+
+    @field_validator("temporal_resolution", mode="before")
+    @classmethod
+    def _resolution_normalise(cls, v):
+        """Accept synonyms Gemini may emit; anything else becomes null."""
+        if v is None:
+            return None
+        v = str(v).strip().lower()
+        aliases = {
+            "day": "daily", "days": "daily", "daily": "daily",
+            "week": "weekly", "weeks": "weekly", "weekly": "weekly",
+            "month": "monthly", "months": "monthly", "monthly": "monthly",
+            "season": "seasonal", "seasons": "seasonal", "seasonal": "seasonal",
+            "year": "annual", "years": "annual", "yearly": "annual", "annual": "annual",
+        }
+        return aliases.get(v)
+
+    @field_validator("start_date", "end_date", "event_date", mode="before")
+    @classmethod
+    def _date_normalise(cls, v):
+        """Keep only well-formed YYYY-MM-DD strings."""
+        if v is None:
+            return None
+        v = str(v).strip()
+        if len(v) >= 10 and v[4] == "-" and v[7] == "-":
+            try:
+                from datetime import date
+                date.fromisoformat(v[:10])
+                return v[:10]
+            except ValueError:
+                return None
+        return None
+
     # --- Business-search parameters ---
     business_type: Optional[str] = Field(
         default=None,

@@ -151,6 +151,10 @@ def extract_prior_fields(session_id: str) -> dict:
         "end_year": state.end_year,
         "start_month": sm,
         "end_month": em,
+        "temporal_resolution": p.get("temporal_resolution"),
+        "start_date": p.get("start_date"),
+        "end_date": p.get("end_date"),
+        "event_date": p.get("event_date"),
         "specific_months": state.specific_months,
         "business_type": p.get("business_type"),
         "keyword": p.get("keyword"),
@@ -193,6 +197,10 @@ def apply_decision_to_state(session_id: str, decision) -> None:
         state.parameters = params
 
     params = state.parameters or {}
+    for key in ("temporal_resolution", "start_date", "end_date", "event_date"):
+        val = getattr(decision, key, None)
+        if val:
+            params[key] = val
     if decision.business_type:
         params["business_type"] = decision.business_type
     if decision.keyword:

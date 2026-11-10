@@ -157,6 +157,11 @@ def _process_analysis_sync(
         sessions[sid]["progress"] = 10
         sessions[sid]["message"] = "Processing data…"
 
+        # Let processors publish planner/progress steps (shown as thinking steps)
+        def _progress_cb(msg: str) -> None:
+            sessions[sid]["message"] = str(msg)[:200]
+        processor.progress_cb = _progress_cb
+
         if agent_service.AGENT_LOOP_ENABLED:
             result, request = _run_with_agent(processor, request, sessions)
         else:
@@ -304,6 +309,9 @@ def _save_completion_message(request: AnalysisRequest, result: AnalysisResult) -
             f"Your {atype} analysis{f' for {loc}' if loc else ''} "
             f"is complete ({t}s). Results are ready — check the Map and Charts tabs!"
         )
+        plan_summary = (result.metadata or {}).get("plan_summary") if isinstance(result.metadata, dict) else None
+        if plan_summary:
+            msg = f"{msg}\n\n{str(plan_summary)[:900]}"
         save_message(conv_sid, user_id, "assistant", msg)
     except Exception as exc:
         print(f"⚠️  Could not save completion message: {exc}")

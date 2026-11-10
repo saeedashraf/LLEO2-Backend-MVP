@@ -226,6 +226,10 @@ async def analyze_from_conversation(
             end_year=prior.get("end_year"),
             start_month=prior.get("start_month"),
             end_month=prior.get("end_month"),
+            temporal_resolution=prior.get("temporal_resolution"),
+            start_date=prior.get("start_date"),
+            end_date=prior.get("end_date"),
+            event_date=prior.get("event_date"),
             business_type=prior.get("business_type"),
             keyword=prior.get("keyword"),
             radius=prior.get("radius") or 2000,
@@ -330,6 +334,7 @@ def _decision_to_response(session_id: str, d: RoutingDecision) -> dict:
         "longitude": d.longitude,
         "start_year": d.start_year,
         "end_year": d.end_year,
+        "temporal_resolution": d.temporal_resolution,
         "confidence": d.confidence.value,
         "needs_clarification": d.needs_clarification,
         "ready_to_analyze": ready,
@@ -374,6 +379,15 @@ async def _launch_analysis(
         time_period["start_month"] = decision.start_month
     if decision.end_month:
         time_period["end_month"] = decision.end_month
+    # Temporal resolution + exact dates (planner input; see routing/analysis_planner.py)
+    if decision.temporal_resolution:
+        time_period["temporal_resolution"] = decision.temporal_resolution
+    if decision.start_date:
+        time_period["start_date"] = decision.start_date
+    if decision.end_date:
+        time_period["end_date"] = decision.end_date
+    if decision.event_date:
+        time_period["event_date"] = decision.event_date
 
     # ── Satellite data-availability guard ────────────────────────────
     # Clamp start_year to the earliest date the satellite actually has data.

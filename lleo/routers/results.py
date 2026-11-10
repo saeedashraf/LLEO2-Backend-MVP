@@ -126,6 +126,14 @@ async def analyze_query(
             time_period["start_month"] = decision.start_month
         if decision.end_month:
             time_period["end_month"] = decision.end_month
+        if decision.temporal_resolution:
+            time_period["temporal_resolution"] = decision.temporal_resolution
+        if decision.start_date:
+            time_period["start_date"] = decision.start_date
+        if decision.end_date:
+            time_period["end_date"] = decision.end_date
+        if decision.event_date:
+            time_period["event_date"] = decision.event_date
 
         # ── Satellite data-availability guard ────────────────────────
         _EARLIEST = {

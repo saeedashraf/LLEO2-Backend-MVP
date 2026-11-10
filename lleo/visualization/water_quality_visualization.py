@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import numpy as np
+import textwrap
+from datetime import date, datetime
+import matplotlib.dates as mdates
 import ee
 from typing import Dict, Any, Optional
 
@@ -95,6 +98,42 @@ def _add_vertical_legend(m: folium.Map, vis: dict, layer_idx: int = 0) -> None:
     </div>
     """
     m.get_root().html.add_child(folium.Element(html))
+
+
+def _num(v, default: float = 0.0) -> float:
+    """Coerce a possibly-None period value for bar charts (no-data → default)."""
+    try:
+        return default if v is None else float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _nan(v) -> float:
+    """Coerce for line charts: None → NaN so matplotlib leaves a gap."""
+    try:
+        return np.nan if v is None else float(v)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _period_date(period: Dict[str, Any]):
+    """Start date of a period as a datetime, or None if not parseable."""
+    dr = period.get('date_range') or {}
+    raw = dr.get('start')
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
+
+
+def _wrap(text: str, width: int = 70, max_lines: int = 8) -> str:
+    lines = textwrap.wrap(str(text or ''), width=width)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip('.') + ' ...'
+    return "\n".join(lines)
 
 
 class WaterQualityVisualization:
@@ -301,7 +340,13 @@ class WaterQualityVisualization:
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=figsize)
 
         # Create title
-        if self.start_year == self.end_year:
+        strategy = data.get('strategy') or {}
+        window = strategy.get('window') or {}
+        if 'time_series' in data and window.get('start') and window.get('end'):
+            res = strategy.get('resolution') or 'time'
+            title = (f'Water Quality Analysis: {self.location_name} '
+                     f'({res} series, {window["start"]} to {window["end"]})')
+        elif self.start_year == self.end_year:
             title = f'Water Quality Analysis: {self.location_name} ({self.start_year})'
         else:
             title = f'Water Quality Analysis: {self.location_name} ({self.start_year} vs {self.end_year})'
@@ -340,18 +385,18 @@ class WaterQualityVisualization:
         # Parameters comparison - side by side bars
         parameters = ['NDWI', 'Turbidity', 'Chlorophyll', 'TSM', 'CDOM']
         year1_values = [
-            year1_data.get('ndwi', 0),
-            year1_data.get('turbidity', 0),
-            year1_data.get('chlorophyll', 0),
-            year1_data.get('tsm', 0),
-            year1_data.get('cdom', 0)
+            _num(year1_data.get('ndwi')),
+            _num(year1_data.get('turbidity')),
+            _num(year1_data.get('chlorophyll')),
+            _num(year1_data.get('tsm')),
+            _num(year1_data.get('cdom'))
         ]
         year2_values = [
-            year2_data.get('ndwi', 0),
-            year2_data.get('turbidity', 0),
-            year2_data.get('chlorophyll', 0),
-            year2_data.get('tsm', 0),
-            year2_data.get('cdom', 0)
+            _num(year2_data.get('ndwi')),
+            _num(year2_data.get('turbidity')),
+            _num(year2_data.get('chlorophyll')),
+            _num(year2_data.get('tsm')),
+            _num(year2_data.get('cdom'))
         ]
 
         x = np.arange(len(parameters))
@@ -379,8 +424,8 @@ class WaterQualityVisualization:
                     f'{height:.3f}', ha='center', va='bottom', fontsize=8)
 
         # Water Quality Index comparison
-        wqi1 = year1_data.get('water_quality_index', 50)
-        wqi2 = year2_data.get('water_quality_index', 50)
+        wqi1 = _num(year1_data.get('water_quality_index'), 50)
+        wqi2 = _num(year2_data.get('water_quality_index'), 50)
 
         wqi_comparison = [wqi1, wqi2]
         ax2.bar(years, wqi_comparison, color=['#4169e1', '#ff7f50'], alpha=0.8)
@@ -431,11 +476,11 @@ class WaterQualityVisualization:
         """Create charts for single period analysis"""
         parameters = ['NDWI', 'Turbidity', 'Chlorophyll', 'TSM', 'CDOM']
         values = [
-            data.get('ndwi', 0),
-            data.get('turbidity', 0),
-            data.get('chlorophyll', 0),
-            data.get('tsm', 0),
-            data.get('cdom', 0)
+            _num(data.get('ndwi')),
+            _num(data.get('turbidity')),
+            _num(data.get('chlorophyll')),
+            _num(data.get('tsm')),
+            _num(data.get('cdom'))
         ]
         colors = ['#4169e1', '#8b4513', '#228b22', '#b8860b', '#6a3d9a']
 
@@ -448,7 +493,7 @@ class WaterQualityVisualization:
             ax1.text(i, v, f'{v:.3f}', ha='center', va='bottom')
 
         # Water Quality Index
-        wqi = data.get('water_quality_index', 50)
+        wqi = _num(data.get('water_quality_index'), 50)
         ax2.pie([wqi, 100-wqi], labels=['Quality', 'Deficiency'],
                 autopct='%1.1f%%', colors=['#00ff00', '#ff0000'], startangle=90)
         ax2.set_title(f'Water Quality Index: {wqi:.1f}%', fontsize=12, fontweight='bold')
@@ -487,18 +532,18 @@ class WaterQualityVisualization:
         # Parameters comparison - side by side bars
         parameters = ['NDWI', 'Turbidity', 'Chlorophyll', 'TSM', 'CDOM']
         period1_values = [
-            period1_data.get('ndwi', 0),
-            period1_data.get('turbidity', 0),
-            period1_data.get('chlorophyll', 0),
-            period1_data.get('tsm', 0),
-            period1_data.get('cdom', 0)
+            _num(period1_data.get('ndwi')),
+            _num(period1_data.get('turbidity')),
+            _num(period1_data.get('chlorophyll')),
+            _num(period1_data.get('tsm')),
+            _num(period1_data.get('cdom'))
         ]
         period2_values = [
-            period2_data.get('ndwi', 0),
-            period2_data.get('turbidity', 0),
-            period2_data.get('chlorophyll', 0),
-            period2_data.get('tsm', 0),
-            period2_data.get('cdom', 0)
+            _num(period2_data.get('ndwi')),
+            _num(period2_data.get('turbidity')),
+            _num(period2_data.get('chlorophyll')),
+            _num(period2_data.get('tsm')),
+            _num(period2_data.get('cdom'))
         ]
 
         x = np.arange(len(parameters))
@@ -533,7 +578,7 @@ class WaterQualityVisualization:
         ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
         ax2.set_xlabel('Parameters', fontweight='bold')
         ax2.set_ylabel('Change (Δ Index / Ratio)', fontweight='bold')
-        ax2.set_title(f'Change: {labels[0]} → {labels[1]}', fontsize=12, fontweight='bold')
+        ax2.set_title(_wrap(f'Change: {labels[0]} → {labels[1]}', 60, 2), fontsize=11, fontweight='bold')
         ax2.grid(True, alpha=0.3)
 
         # Add value labels on bars
@@ -543,10 +588,10 @@ class WaterQualityVisualization:
                     f'{change:+.3f}', ha='center', va='bottom' if height > 0 else 'top', fontsize=9)
 
         # Water Quality Index comparison
-        wqi1 = period1_data.get('water_quality_index', 50)
-        wqi2 = period2_data.get('water_quality_index', 50)
+        wqi1 = _num(period1_data.get('water_quality_index'), 50)
+        wqi2 = _num(period2_data.get('water_quality_index'), 50)
 
-        ax3.bar([labels[0], labels[1]], [wqi1, wqi2], color=['#4169e1', '#ff7f50'], alpha=0.8)
+        ax3.bar([_wrap(labels[0], 18, 3), _wrap(labels[1], 18, 3)], [wqi1, wqi2], color=['#4169e1', '#ff7f50'], alpha=0.8)
         ax3.set_ylabel('WQI Score (0–100)', fontweight='bold')
         ax3.set_title('Water Quality Index', fontsize=12, fontweight='bold')
         ax3.set_ylim([0, 100])
@@ -563,84 +608,161 @@ class WaterQualityVisualization:
         reasoning = strategy.get('reasoning', 'AI-guided analysis strategy')
         strategy_type = strategy.get('strategy_type', 'comparison')
 
+        def _coverage(pd: Dict[str, Any]) -> str:
+            if pd.get('no_data'):
+                return 'no cloud-free image'
+            n = pd.get('n_images')
+            return f'{n} image(s)' if n is not None else 'data available'
+
         ax4.axis('off')
-        info_text = f"""
-        Analysis Strategy: {strategy_type.replace('_', ' ').title()}
-
-        Periods Analyzed:
-        • {labels[0]}
-        • {labels[1]}
-
-        Reasoning:
-        {reasoning[:200]}...
-
-        Water Quality Assessment:
-        • NDWI Change: {changes[0]:+.3f}
-        • Turbidity Change: {changes[1]:+.3f}
-        • Chlorophyll Change: {changes[2]:+.3f}
-        • TSM Change: {changes[3]:+.3f}
-        • CDOM Change: {changes[4]:+.3f}
-        """
-        ax4.text(0.1, 0.9, info_text, transform=ax4.transAxes,
-                fontsize=10, verticalalignment='top', family='monospace',
+        info_lines = [
+            f"Analysis Strategy: {str(strategy_type).replace('_', ' ').title()}",
+            "",
+            "Periods Analyzed:",
+            _wrap(f"- {labels[0]}: {_coverage(period1_data)}", 66, 2),
+            _wrap(f"- {labels[1]}: {_coverage(period2_data)}", 66, 2),
+            "",
+            "Reasoning:",
+            _wrap(reasoning, 66, 7),
+            "",
+            "Water Quality Assessment:",
+            f"- NDWI Change: {changes[0]:+.3f}",
+            f"- Turbidity Change: {changes[1]:+.3f}",
+            f"- Chlorophyll Change: {changes[2]:+.3f}",
+            f"- TSM Change: {changes[3]:+.3f}",
+            f"- CDOM Change: {changes[4]:+.3f}",
+        ]
+        if period1_data.get('no_data') or period2_data.get('no_data'):
+            info_lines.append("")
+            info_lines.append("Note: a period without cloud-free imagery is shown as 0 and not comparable.")
+        ax4.text(0.02, 0.98, "\n".join(info_lines), transform=ax4.transAxes,
+                fontsize=8, verticalalignment='top', family='monospace',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     def _create_time_series_charts(self, data: Dict[str, Any], ax1, ax2, ax3, ax4):
-        """Create charts for time series analysis (e.g., monthly progression)"""
+        """Create charts for time series analysis (weekly, monthly, per acquisition ...).
+
+        Periods flagged ``no_data`` are drawn as gaps (NaN) and shaded, never as
+        placeholder values.  The x axis is a real date axis when every period
+        carries a parseable ``date_range``; otherwise labels are used.
+        """
         time_series = data['time_series']
-        labels = [period['label'] for period in time_series]
+        strategy = data.get('strategy') or {}
+        resolution = strategy.get('resolution') or (time_series[0].get('resolution') if time_series else None)
+        labels = [str(period.get('label', '')) for period in time_series]
 
-        ndwi_values = [period.get('ndwi', 0) for period in time_series]
-        turbidity_values = [period.get('turbidity', 0) for period in time_series]
-        chlorophyll_values = [period.get('chlorophyll', 0) for period in time_series]
-        tsm_values = [period.get('tsm', 0) for period in time_series]
-        cdom_values = [period.get('cdom', 0) for period in time_series]
-        wqi_values = [period.get('water_quality_index', 50) for period in time_series]
+        ndwi_values = np.array([_nan(period.get('ndwi')) for period in time_series])
+        turbidity_values = np.array([_nan(period.get('turbidity')) for period in time_series])
+        chlorophyll_values = np.array([_nan(period.get('chlorophyll')) for period in time_series])
+        tsm_values = np.array([_nan(period.get('tsm')) for period in time_series])
+        cdom_values = np.array([_nan(period.get('cdom')) for period in time_series])
+        wqi_values = np.array([_nan(period.get('water_quality_index')) for period in time_series])
+        n_images = [int(period.get('n_images') or 0) for period in time_series]
+        gap_idx = [i for i, period in enumerate(time_series) if period.get('no_data')]
 
-        x = np.arange(len(labels))
+        dates = [_period_date(period) for period in time_series]
+        use_dates = len(dates) > 0 and all(d is not None for d in dates)
+        if use_dates:
+            x = np.array(dates)
+            fmt = {'daily': '%d %b', 'weekly': '%d %b', 'monthly': '%b %Y',
+                   'seasonal': '%b %Y', 'annual': '%Y'}.get(resolution or '', '%d %b %Y')
+            x_label = {'daily': 'Acquisition date', 'weekly': 'Week starting',
+                       'monthly': 'Month', 'seasonal': 'Season start',
+                       'annual': 'Year'}.get(resolution or '', 'Date')
+        else:
+            x = np.arange(len(labels))
+            x_label = 'Time Period'
 
-        # NDWI time series
-        ax1.plot(x, ndwi_values, marker='o', color='#4169e1', linewidth=2, markersize=6, label='NDWI')
-        ax1.set_xlabel('Time Period', fontweight='bold')
-        ax1.set_ylabel('NDWI (index, −1 to +1)', fontweight='bold')
-        ax1.set_title('Water Index Over Time', fontsize=12, fontweight='bold')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(labels, rotation=45, ha='right')
-        ax1.grid(True, alpha=0.3)
+        axes = (ax1, ax2, ax3, ax4)
 
-        # Turbidity & Chlorophyll time series (share ax2)
-        ax2.plot(x, turbidity_values, marker='s', color='#ff7f50', linewidth=2, markersize=6, label='Turbidity (NDTI)')
-        ax2.plot(x, chlorophyll_values, marker='^', color='#32cd32', linewidth=2, markersize=6, label='Chlorophyll (NDCI)')
-        ax2.set_xlabel('Time Period', fontweight='bold')
-        ax2.set_ylabel('Normalised Index (−1 to +1)', fontweight='bold')
-        ax2.set_title('Turbidity & Chlorophyll Over Time', fontsize=12, fontweight='bold')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(labels, rotation=45, ha='right')
+        def _decorate(ax, title, ylabel):
+            ax.set_title(title, fontsize=12, fontweight='bold')
+            ax.set_xlabel(x_label, fontweight='bold')
+            ax.set_ylabel(ylabel, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            if use_dates:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=10))
+                for lbl in ax.get_xticklabels():
+                    lbl.set_rotation(45)
+                    lbl.set_ha('right')
+            else:
+                step = max(1, int(np.ceil(len(labels) / 12)))
+                ax.set_xticks(x[::step])
+                ax.set_xticklabels(labels[::step], rotation=45, ha='right')
+
+        # Shade periods without cloud-free imagery on every panel
+        if gap_idx:
+            for ax in axes:
+                for i in gap_idx:
+                    if use_dates:
+                        dr = time_series[i].get('date_range') or {}
+                        try:
+                            x0 = datetime.fromisoformat(str(dr.get('start'))[:10])
+                            x1 = datetime.fromisoformat(str(dr.get('end'))[:10])
+                        except (TypeError, ValueError):
+                            continue
+                    else:
+                        x0, x1 = i - 0.5, i + 0.5
+                    ax.axvspan(x0, x1, color='#999999', alpha=0.15, lw=0)
+
+        # Event marker (flood, landslide ...) if the planner found one
+        event_line = None
+        event_raw = strategy.get('event_date')
+        if use_dates and event_raw:
+            try:
+                event_line = datetime.fromisoformat(str(event_raw)[:10])
+            except ValueError:
+                event_line = None
+        if event_line is not None:
+            for ax in axes:
+                ax.axvline(event_line, color='#d62728', linestyle='--', linewidth=1.2, alpha=0.8)
+
+        # NDWI + image count
+        ax1.plot(x, ndwi_values, marker='o', color='#4169e1', linewidth=2, markersize=5, label='NDWI')
+        _decorate(ax1, 'Water Index Over Time', 'NDWI (index, −1 to +1)')
+        ax1b = ax1.twinx()
+        width = (0.8 if not use_dates else
+                 {'daily': 0.8, 'weekly': 5.0, 'monthly': 20.0, 'seasonal': 60.0, 'annual': 250.0}.get(resolution or '', 1.0))
+        ax1b.bar(x, n_images, width=width, color='#bbbbbb', alpha=0.35, label='Clear images', align='edge' if use_dates else 'center')
+        ax1b.set_ylabel('Clear Sentinel-2 images', color='#777777', fontsize=8)
+        ax1b.tick_params(axis='y', labelcolor='#777777', labelsize=8)
+        ax1b.set_ylim(0, max(1, max(n_images) if n_images else 1) * 3)
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax1b.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, fontsize=8, loc='upper left')
+
+        # Turbidity & Chlorophyll
+        ax2.plot(x, turbidity_values, marker='s', color='#ff7f50', linewidth=2, markersize=5, label='Turbidity (NDTI)')
+        ax2.plot(x, chlorophyll_values, marker='^', color='#32cd32', linewidth=2, markersize=5, label='Chlorophyll (NDCI)')
+        _decorate(ax2, 'Turbidity & Chlorophyll Over Time', 'Normalised Index (−1 to +1)')
         ax2.legend(fontsize=8)
-        ax2.grid(True, alpha=0.3)
 
-        # TSM & CDOM time series (share ax3)
-        ax3.plot(x, tsm_values, marker='v', color='#b8860b', linewidth=2, markersize=6, label='TSM')
-        ax3.plot(x, cdom_values, marker='D', color='#6a3d9a', linewidth=2, markersize=6, label='CDOM')
-        ax3.set_xlabel('Time Period', fontweight='bold')
-        ax3.set_ylabel('TSM (reflectance) / CDOM (ratio)', fontweight='bold')
-        ax3.set_title('TSM & CDOM Over Time', fontsize=12, fontweight='bold')
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(labels, rotation=45, ha='right')
+        # TSM & CDOM
+        ax3.plot(x, tsm_values, marker='v', color='#b8860b', linewidth=2, markersize=5, label='TSM')
+        ax3.plot(x, cdom_values, marker='D', color='#6a3d9a', linewidth=2, markersize=5, label='CDOM')
+        _decorate(ax3, 'TSM & CDOM Over Time', 'TSM (reflectance) / CDOM (ratio)')
         ax3.legend(fontsize=8)
-        ax3.grid(True, alpha=0.3)
 
-        # WQI time series
-        ax4.plot(x, wqi_values, marker='D', color='#9370db', linewidth=2, markersize=6, label='WQI')
+        # WQI
+        ax4.plot(x, wqi_values, marker='D', color='#9370db', linewidth=2, markersize=5, label='WQI')
         ax4.axhline(y=50, color='orange', linestyle='--', label='Threshold', alpha=0.5)
-        ax4.set_xlabel('Time Period', fontweight='bold')
-        ax4.set_ylabel('WQI Score (0–100)', fontweight='bold')
-        ax4.set_title('Water Quality Index Over Time', fontsize=12, fontweight='bold')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(labels, rotation=45, ha='right')
+        if event_line is not None:
+            ax4.plot([], [], color='#d62728', linestyle='--', label=f'Event {str(event_raw)[:10]}')
+        if gap_idx:
+            ax4.fill_between([], [], [], color='#999999', alpha=0.15, label='No cloud-free image')
+        _decorate(ax4, 'Water Quality Index Over Time', 'WQI Score (0–100)')
         ax4.set_ylim([0, 100])
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
+        ax4.legend(fontsize=8)
+
+        # Coverage note
+        n_total = len(time_series)
+        n_gaps = len(gap_idx)
+        note = f"{n_total - n_gaps} of {n_total} {resolution or ''} periods with cloud-free Sentinel-2 data".replace('  ', ' ')
+        if n_gaps:
+            note += f"; {n_gaps} shown as gaps"
+        ax4.text(0.99, 0.02, note, transform=ax4.transAxes, fontsize=8, ha='right', va='bottom',
+                 color='#555555', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, lw=0))
 
     @staticmethod
     def calculate_wqi(

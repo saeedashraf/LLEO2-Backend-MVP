@@ -65,6 +65,7 @@ KNOBS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "water_quality": {
         "start_year": {"min": 2015},
         "end_year": {"max": "now"},
+        "cloud_cover_threshold": {"min": 10, "max": 80},
     },
     "air_quality": {
         "start_year": {"min": 2018},
@@ -201,6 +202,17 @@ def observe(request: AnalysisRequest, result: Optional[AnalysisResult],
         if counts and sum(counts) == 0:
             quality = "none"
 
+    elif atype == "water_quality":
+        cov = meta.get("data_coverage") or {}
+        n_periods = int(cov.get("periods") or 0)
+        n_with = int(cov.get("with_data") or 0)
+        metrics = {"periods": n_periods, "periods_with_data": n_with,
+                   "cloud_cover_threshold": meta.get("cloud_cover_threshold")}
+        if n_periods and n_with == 0:
+            quality = "none"
+        elif n_periods and n_with / n_periods < 0.5:
+            quality = "low"
+
     elif atype == "vegetation_index":
         stats = meta.get("statistics") or {}
         metrics = {"has_statistics": bool(stats),
@@ -259,6 +271,15 @@ def rule_replan(req: AnalysisRequest, obs: Observation, attempt: int) -> Optiona
             return Decision("retry", {"start_year": sy + 1},
                             reason="still no data; moving the start year later",
                             user_message=f"Still no usable imagery for {sy} — comparing {sy + 1} → {ey} instead.")
+
+    # ── water quality: cloudy periods → relax the scene cloud filter once or twice
+    if atype == "water_quality" and (no_data or thin):
+        cc = int(pr.get("cloud_cover_threshold", 20))
+        if cc < 60:
+            ncc = min(60, cc + 20)
+            return Decision("retry", {"cloud_cover_threshold": ncc},
+                            reason=f"few periods had clear Sentinel-2 scenes at <{cc}% cloud; relaxing to {ncc}%",
+                            user_message=f"Many periods had no cloud-free Sentinel-2 image at <{cc}% cloud cover. Retrying with a more lenient {ncc}% threshold.")
 
     # ── timelapse: too long / too heavy → shrink; too few frames → widen months
     if atype == "video_animation":
