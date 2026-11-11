@@ -16,7 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Form, HTTPException
 
 from ..config import services
-from ..models.routing import RoutingDecision
+from ..models.routing import RoutingDecision, describe_decision
 from ..services.router_service import route_query
 from ..services.geocoding_service import build_location_from_decision, flatten_location
 from ..services.conversation_service import (
@@ -461,6 +461,7 @@ async def _launch_analysis(
         "status": "processing",
         "progress": 0,
         "message": "Queued…",
+        "steps": [describe_decision(decision, loc, time_period, params), "Queued…"],
         "user_id": user_id,
         "analysis_type": decision.intent.value,
         "location": decision.location_name,

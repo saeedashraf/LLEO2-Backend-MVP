@@ -193,3 +193,75 @@ def test_routing_decision_normalises_resolution_and_dates():
     assert d.end_date is None
     assert d.event_date == "2026-08-26"
     assert RoutingDecision(intent="water_quality", temporal_resolution="hourly").temporal_resolution is None
+
+
+# ── auto_resolution (no cadence given by the user) ───────────────────────────
+
+def test_auto_short_window_is_per_acquisition():
+    res = ap.auto_resolution("water quality of Lake Zurich last week",
+                             {"start_date": "2026-11-03", "end_date": "2026-11-10"}, TODAY)
+    assert res is not None
+    assert res[0] == "daily" and "acquisition" in res[1]
+
+
+def test_auto_event_is_weekly():
+    res = ap.auto_resolution("TSM in the Trishuli after the flood",
+                             {"start_year": 2026, "start_month": 8, "end_month": 11,
+                              "event_date": "2026-08-26"}, TODAY)
+    assert res == ("weekly", res[1]) and "2026-08-26" in res[1]
+
+
+def test_auto_few_months_is_weekly():
+    res = ap.auto_resolution("turbidity Lake Geneva",
+                             {"start_year": 2026, "start_month": 8, "end_month": 10}, TODAY)
+    assert res[0] == "weekly"
+
+
+def test_auto_leaves_comparisons_and_long_windows_to_llm():
+    assert ap.auto_resolution("compare January vs March 2026",
+                              {"start_year": 2026, "start_month": 1, "end_month": 3}, TODAY) is None
+    assert ap.auto_resolution("water quality Lake Zurich", {"start_year": 2026}, TODAY) is None
+
+
+def test_plan_strategy_auto_without_model():
+    import asyncio
+    plan = asyncio.run(ap.plan_analysis_strategy(
+        "chlorophyll in Lake Constance in the last month", "water_quality", "Lake Constance",
+        {"start_date": "2026-10-11", "end_date": "2026-11-10", "start_year": 2026}, None))
+    assert plan["planner"] == "auto"
+    assert plan["resolution"] == "weekly"
+    assert plan["reasoning"].startswith("No resolution was requested")
+    assert 4 <= len(plan["time_periods"]) <= 6
+
+
+# ── describe_decision / reasoning field ──────────────────────────────────────
+
+def test_describe_decision_mentions_window_and_reasoning():
+    from lleo.models.routing import describe_decision
+    d = RoutingDecision(intent="water_quality", location_name="Trishuli River", latitude=28.0,
+                        longitude=85.2, reasoning="Flood impact question, weekly window after the event.")
+    text = describe_decision(d, {"name": "Trishuli River", "latitude": 28.0, "longitude": 85.2},
+                             {"start_date": "2026-08-26", "event_date": "2026-08-26",
+                              "temporal_resolution": "weekly"},
+                             {"water_indicators": ["TSM", "CDOM"]})
+    assert text.startswith("Understood the request as water quality for Trishuli River (28.0000, 85.2000).")
+    assert "Window: 2026-08-26 to today." in text
+    assert "Event date: 2026-08-26." in text
+    assert "Requested resolution: weekly." in text
+    assert "Indicators: TSM, CDOM." in text
+    assert text.endswith("Router reasoning: Flood impact question, weekly window after the event.")
+
+
+def test_push_step_keeps_full_trace():
+    from lleo.services.analysis_service import push_step, MAX_STEPS
+    sessions = {"s": {}}
+    push_step(sessions, "s", "a", progress=10)
+    push_step(sessions, "s", "a")          # duplicate collapsed
+    push_step(sessions, "s", "b" * 1000)   # long step trimmed, message short
+    assert sessions["s"]["steps"][0] == "a" and len(sessions["s"]["steps"]) == 2
+    assert len(sessions["s"]["message"]) == 200 and len(sessions["s"]["steps"][1]) == 700
+    assert sessions["s"]["progress"] == 10
+    for i in range(MAX_STEPS + 20):
+        push_step(sessions, "s", f"step {i}")
+    assert len(sessions["s"]["steps"]) == MAX_STEPS
+    push_step(sessions, "missing", "ignored")

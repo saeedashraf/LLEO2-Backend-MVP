@@ -16,7 +16,7 @@ from lleo.core.config import LLEOConfig
 from lleo.core.exceptions import ProcessorException, ValidationException, EarthEngineException
 from ..visualization.water_quality_visualization import WaterQualityVisualization
 from lleo.routing.analysis_planner import (
-    plan_analysis_strategy, summarise_plan, RESOLUTIONS, MAX_PERIODS,
+    plan_analysis_strategy, summarise_plan, auto_resolution, RESOLUTIONS, MAX_PERIODS,
 )
 
 # Keys that hold ee.Image objects in a period result (stripped before persisting)
@@ -195,8 +195,10 @@ class WaterQualityProcessor(BaseProcessor):
             # planning runs even when no Gemini model is attached.
             analysis_strategy = None
             explicit_resolution = request.time_period.get('temporal_resolution') in RESOLUTIONS
+            # Short windows / dated events get a cadence without an LLM (auto_resolution)
+            auto_cadence = auto_resolution(request.query, request.time_period) is not None
             cloud_thr = self._cloud_threshold(request)
-            if self.model or explicit_resolution:
+            if self.model or explicit_resolution or auto_cadence:
                 try:
                     self._progress("Planning the analysis strategy (time windows and resolution)…")
                     analysis_strategy = await plan_analysis_strategy(
@@ -212,7 +214,7 @@ class WaterQualityProcessor(BaseProcessor):
                         f"resolution={analysis_strategy.get('resolution')}",
                         session_id=request.session_id
                     )
-                    self._progress(f"Plan: {summarise_plan(analysis_strategy)}"[:200])
+                    self._progress(f"Plan: {summarise_plan(analysis_strategy)}")
                 except Exception as e:
                     self.log_error(f"Analysis planning failed, using fallback: {e}", session_id=request.session_id)
                     analysis_strategy = None
@@ -276,6 +278,11 @@ class WaterQualityProcessor(BaseProcessor):
                             period_data['resolution'] = period['resolution']
                         period_results.append(period_data)
 
+                if len(period_results) > 1:
+                    counts = ", ".join(
+                        f"{pr.get('label')}: {pr.get('n_images') or 0}" for pr in period_results
+                    )
+                    self._progress(f"Clear Sentinel-2 scenes per period: {counts}")
                 gaps = [pr['label'] for pr in period_results if pr.get('no_data')]
                 if gaps:
                     self._progress(
@@ -466,7 +473,7 @@ class WaterQualityProcessor(BaseProcessor):
                     'with_data': n_with_data,
                     'gaps': [pr.get('label') for pr in series if pr.get('no_data')],
                 }
-                self._progress(plan_summary[:200])
+                self._progress(plan_summary)
 
             # Create temporary directory for files
             temp_dir = self.config.temp_dir

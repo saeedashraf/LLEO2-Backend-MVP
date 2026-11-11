@@ -62,6 +62,12 @@ Your ONLY job is to read a user's message and return ONE JSON object.
    - **Event date** (`event_date`, YYYY-MM-DD): when the question is about the impact of
      a dated event ("after the 26 August 2026 flood", "since the dam broke on 3 May 2024"),
      put that date here and set start_date to it unless the user asks for an earlier start.
+   - **Relative phrases** become exact dates counted back from today ({date.today().isoformat()}):
+     "last week" / "past week" → start_date = today minus 7 days, end_date = today;
+     "last 10 days" → today minus 10 days; "last month" / "past 30 days" → today minus 30 days;
+     "recent", "recently", "latest", "currently", "right now", "these days" → today minus 30 days;
+     "last 3 months" → today minus 90 days. Also set start_year/end_year/start_month/end_month
+     consistently. Leave temporal_resolution null for these; the planner picks the cadence.
 
 4. Fill any analysis-specific parameters (pollutants, water_indicators, etc.).
 
@@ -147,7 +153,7 @@ keep the same intent and location, just fill in the parameters.
 JSON_INSTRUCTION = f"""\
 Respond with ONLY a JSON object. No markdown, no explanation, nothing else.
 
-Use exactly these 22 keys (null for unknown, [] for empty arrays):
+Use exactly these 23 keys (null for unknown, [] for empty arrays):
 
 {{
   "intent": "weather_forecast",
@@ -171,11 +177,14 @@ Use exactly these 22 keys (null for unknown, [] for empty arrays):
   "vegetation_index_type": null,
   "needs_clarification": [],
   "clarification_message": null,
-  "general_answer": null
+  "general_answer": null,
+  "reasoning": "Weather forecast for Aarhus; no time range given so the current year is used."
 }}
 
 IMPORTANT:
-- ALL 22 keys must be present in your response.
+- ALL 23 keys must be present in your response.
+- reasoning: one or two plain sentences on how you read the request (intent, location,
+  time window, why those dates). It is shown to the user. No markdown.
 - temporal_resolution: one of "daily", "weekly", "monthly", "seasonal", "annual" or null.
 - start_date / end_date / event_date: "YYYY-MM-DD" strings or null.
 - latitude and longitude: use decimal degrees. You know them for all cities.
@@ -348,7 +357,7 @@ def _parse_json(raw: str) -> dict:
     for key in (
         "intent", "confidence", "location_name",
         "clarification_message", "general_answer",
-        "temporal_resolution", "start_date", "end_date", "event_date",
+        "temporal_resolution", "start_date", "end_date", "event_date", "reasoning",
     ):
         m2 = re.search(rf'"{key}"\s*:\s*"([^"]*)"', raw)
         if m2:

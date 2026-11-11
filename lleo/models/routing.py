@@ -31,6 +31,49 @@ class Confidence(str, Enum):
     low = "low"
 
 
+def describe_decision(decision: "RoutingDecision", location: Optional[dict] = None,
+                      time_period: Optional[dict] = None,
+                      parameters: Optional[dict] = None) -> str:
+    """Plain-language summary of a routing decision (first reasoning step)."""
+    loc = location or {}
+    tp = time_period or {}
+    params = parameters or {}
+    intent = decision.intent.value if hasattr(decision.intent, "value") else str(decision.intent)
+    parts = [f"Understood the request as {intent.replace('_', ' ')}"]
+    name = loc.get("name") or decision.location_name
+    if name:
+        lat, lon = loc.get("latitude", decision.latitude), loc.get("longitude", decision.longitude)
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and (lat or lon):
+            parts[0] += f" for {name} ({lat:.4f}, {lon:.4f})"
+        else:
+            parts[0] += f" for {name}"
+    parts[0] += "."
+
+    if tp.get("start_date") or tp.get("end_date"):
+        parts.append(f"Window: {tp.get('start_date') or 'archive start'} to {tp.get('end_date') or 'today'}.")
+    elif tp.get("start_year"):
+        sy, ey = tp.get("start_year"), tp.get("end_year") or tp.get("start_year")
+        if tp.get("start_month") or tp.get("end_month"):
+            parts.append(f"Window: months {tp.get('start_month') or 1} to {tp.get('end_month') or 12}, {sy}"
+                         + (f" to {ey}" if ey != sy else "") + ".")
+        else:
+            parts.append(f"Window: {sy}" + (f" to {ey}" if ey != sy else "") + ".")
+    if tp.get("event_date"):
+        parts.append(f"Event date: {tp['event_date']}.")
+    if tp.get("temporal_resolution"):
+        parts.append(f"Requested resolution: {tp['temporal_resolution']}.")
+    else:
+        parts.append("No resolution requested; the planner will choose one.")
+    for key, label in (("water_indicators", "Indicators"), ("pollutants", "Pollutants"),
+                       ("vegetation_index_type", "Index"), ("business_type", "Place type")):
+        val = params.get(key)
+        if val:
+            parts.append(f"{label}: {', '.join(val) if isinstance(val, list) else val}.")
+    if decision.reasoning:
+        parts.append(f"Router reasoning: {decision.reasoning}")
+    return " ".join(parts)
+
+
 class RoutingDecision(BaseModel):
     """
     Single structured output returned by Gemini.
@@ -101,6 +144,14 @@ class RoutingDecision(BaseModel):
         description="YYYY-MM-DD of an event the user refers to (flood, landslide, spill) "
                     "when the question is about before/after that event."
     )
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def _reasoning_normalise(cls, v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s[:600] if s else None
 
     @field_validator("temporal_resolution", mode="before")
     @classmethod
@@ -184,4 +235,11 @@ class RoutingDecision(BaseModel):
     general_answer: Optional[str] = Field(
         default=None,
         description="If intent is general_question, provide the answer directly here."
+    )
+
+    # --- Router reasoning (shown to the user as the first thinking step) ---
+    reasoning: Optional[str] = Field(
+        default=None,
+        description="One or two sentences on how the request was read: intent, "
+                    "location, time window, resolution."
     )

@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from ..config import services
 from ..database.models import AnalysisRecord, get_db
-from ..models.routing import RoutingDecision
+from ..models.routing import RoutingDecision, describe_decision
 from ..services import preview_service
 from ..services.router_service import route_query
 from ..services.geocoding_service import build_location_from_decision, flatten_location
@@ -205,6 +205,7 @@ async def analyze_query(
             "status": "processing",
             "progress": 0,
             "message": "Queued…",
+            "steps": [describe_decision(decision, loc, req.time_period, req.parameters), "Queued…"],
             "user_id": user_id,
             "analysis_type": decision.intent.value,
             "location": loc.get("name"),
@@ -252,6 +253,7 @@ async def get_analysis_status(session_id: str, db: Session = Depends(get_db)):
             "status": mem.get("status", "processing"),
             "progress": mem.get("progress", 0),
             "message": mem.get("message", ""),
+            "steps": list(mem.get("steps") or []),
             "analysis_type": mem.get("analysis_type"),
             "location": mem.get("location"),
         }

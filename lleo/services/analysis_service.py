@@ -143,6 +143,31 @@ async def process_analysis_background(
     )
 
 
+MAX_STEPS = 150        # reasoning steps kept per session
+STEP_CHARS = 700       # longest single step (planner reasoning fits)
+
+
+def push_step(sessions: dict, sid: str, msg, progress: Optional[int] = None) -> None:
+    """Append a reasoning/progress step to the session (served by /status).
+
+    ``message`` keeps the latest step (short), ``steps`` keeps the whole trace
+    so the frontend never misses a step between two polls.
+    """
+    text = str(msg or "").strip()
+    sess = sessions.get(sid)
+    if not text or sess is None:
+        return
+    sess["message"] = text[:200]
+    steps = sess.setdefault("steps", [])
+    text = text[:STEP_CHARS]
+    if not steps or steps[-1] != text:
+        steps.append(text)
+        if len(steps) > MAX_STEPS:
+            del steps[: len(steps) - MAX_STEPS]
+    if progress is not None:
+        sess["progress"] = progress
+
+
 def _process_analysis_sync(
     processor,
     request: AnalysisRequest,
@@ -154,12 +179,11 @@ def _process_analysis_sync(
 
     try:
         print(f"🔄 Background processing: {sid}")
-        sessions[sid]["progress"] = 10
-        sessions[sid]["message"] = "Processing data…"
+        push_step(sessions, sid, "Processing data…", progress=10)
 
         # Let processors publish planner/progress steps (shown as thinking steps)
         def _progress_cb(msg: str) -> None:
-            sessions[sid]["message"] = str(msg)[:200]
+            push_step(sessions, sid, msg)
         processor.progress_cb = _progress_cb
 
         if agent_service.AGENT_LOOP_ENABLED:
@@ -171,9 +195,12 @@ def _process_analysis_sync(
         # /results/{sid}/* reads from the Postgres record, which is written
         # below. Keep the session in "processing" until persistence is done
         # so clients never see "completed" before the files are retrievable.
+        if isinstance(result.metadata, dict):
+            # Persist the trace with the analysis (Details tab, My Analyses)
+            result.metadata["reasoning_steps"] = list(sessions[sid].get("steps") or [])
+        push_step(sessions, sid, "Saving results…")
         sessions[sid].update({
             "progress": 90,
-            "message": "Saving results…",
             "result": {
                 "outputs": result.outputs,
                 "metadata": result.metadata,
@@ -204,10 +231,10 @@ def _process_analysis_sync(
         _save_to_postgres(file_manager, sid, request, result, processor)
 
         # Only now are the artefact endpoints guaranteed to resolve.
+        push_step(sessions, sid, "Analysis completed")
         sessions[sid].update({
             "status": result.status,
             "progress": 100,
-            "message": "Analysis completed",
             "completed_at": datetime.now().isoformat(),
         })
 
@@ -228,10 +255,10 @@ def _process_analysis_sync(
         msg = f"Error: {exc}"
         if outcome is not None and outcome.user_message:
             msg = f"{outcome.user_message} (last error: {exc})"
+        push_step(sessions, sid, msg)
         sessions[sid].update({
             "status": "failed",
             "progress": 0,
-            "message": msg,
             "error": str(exc),
             "failed_at": datetime.now().isoformat(),
         })
@@ -257,8 +284,7 @@ def _run_with_agent(processor, request: AnalysisRequest, sessions: dict):
     sid = request.session_id
 
     def on_step(n: int, msg: str) -> None:
-        sessions[sid]["message"] = f"Attempt {n}: {msg}"[:200]
-        sessions[sid]["progress"] = min(80, 10 + 25 * (n - 1))
+        push_step(sessions, sid, f"Attempt {n}: {msg}", progress=min(80, 10 + 25 * (n - 1)))
 
     outcome = agent_service.run_agent(
         processor, request, _run_processor_sync, on_step=on_step,

@@ -33,6 +33,13 @@ COARSER = {"daily": "weekly", "weekly": "monthly", "monthly": "seasonal",
 
 MAX_PERIODS = 60              # hard cap on Earth Engine windows per analysis
 MAX_DAILY_SPAN_DAYS = 92      # "daily" (per acquisition) beyond this becomes weekly
+
+# Automatic cadence when the user gives none (see auto_resolution)
+AUTO_DAILY_MAX_DAYS = 14      # up to two weeks: every Sentinel-2 acquisition
+AUTO_WEEKLY_MAX_DAYS = 183    # up to six months: weekly composites
+_COMPARISON_RE = re.compile(
+    r"\b(vs\.?|versus|compare|compared|comparison|difference between|against)\b", re.I
+)
 S2_START = date(2015, 6, 23)  # first Sentinel-2A acquisitions
 S2_REVISIT_DAYS = 5
 
@@ -200,9 +207,51 @@ def choose_resolution(start: date, end: date, requested: str) -> Tuple[str, List
     return res, notes
 
 
+def auto_resolution(query: str, time_period: Dict[str, Any],
+                    today: Optional[date] = None) -> Optional[Tuple[str, str]]:
+    """Pick a cadence when the user did not ask for one.
+
+    Short windows (last week, a recent event, a few months) are clearly best
+    served by a series, so no LLM round trip is needed.  Returns
+    ``(resolution, reason)`` or ``None`` when the LLM planner should decide
+    (long windows, or an explicit comparison such as "January vs July").
+    """
+    today = today or date.today()
+    tp = time_period or {}
+    if _COMPARISON_RE.search(query or ""):
+        return None
+    start, end = resolve_window(tp, today)
+    span = (end - start).days + 1
+    event = _parse_date(tp.get("event_date"))
+    window = f"{start.isoformat()} to {end.isoformat()} ({span} days)"
+
+    if span <= AUTO_DAILY_MAX_DAYS:
+        return "daily", (
+            f"No resolution was requested. The window {window} is short, so every "
+            f"Sentinel-2 acquisition (revisit about {S2_REVISIT_DAYS} days) is shown as its own point."
+        )
+    if event is not None:
+        return "weekly", (
+            f"No resolution was requested. The question is about the {event.isoformat()} event, "
+            f"so a weekly series over {window} shows the baseline before it, the change and the recovery."
+        )
+    if span <= AUTO_WEEKLY_MAX_DAYS:
+        weeks = max(1, round(span / 7))
+        return "weekly", (
+            f"No resolution was requested. The window {window} covers about {weeks} weeks, so a weekly "
+            f"series (1 to 2 Sentinel-2 scenes per week) shows the progression without hiding short changes."
+        )
+    return None
+
+
 def build_resolution_plan(time_period: Dict[str, Any], resolution: str,
-                          today: Optional[date] = None) -> Dict[str, Any]:
-    """Deterministic plan for an explicit temporal resolution (no LLM)."""
+                          today: Optional[date] = None,
+                          reason: Optional[str] = None) -> Dict[str, Any]:
+    """Deterministic plan for a temporal resolution (no LLM).
+
+    ``reason`` replaces the default "the user asked for" sentence when the
+    cadence was chosen automatically.
+    """
     today = today or date.today()
     start, end = resolve_window(time_period, today)
     effective, notes = choose_resolution(start, end, resolution)
@@ -210,6 +259,7 @@ def build_resolution_plan(time_period: Dict[str, Any], resolution: str,
     event = _parse_date(time_period.get("event_date"))
 
     reasoning = [
+        reason or
         f"The user asked for a {resolution} series, so the window "
         f"{start.isoformat()} to {end.isoformat()} is split into {effective} steps."
     ]
@@ -243,7 +293,7 @@ def build_resolution_plan(time_period: Dict[str, Any], resolution: str,
         "comparison": {"type": "time_series", "show_difference": False, "show_trends": True},
         "visualization": {"show_time_series_charts": True, "show_trend_analysis": True},
         "reasoning": " ".join(reasoning),
-        "planner": "deterministic",
+        "planner": "auto" if reason else "deterministic",
     }
     if event:
         plan["event_date"] = event.isoformat()
@@ -403,6 +453,17 @@ async def plan_analysis_strategy(
         plan = build_resolution_plan(time_period, resolution)
         plan = normalise_plan(plan, time_period)
         print(f"📋 ANALYSIS STRATEGY (deterministic): {plan.get('strategy_type')}, "
+              f"{len(plan.get('time_periods', []))} periods, resolution={plan.get('resolution')}")
+        print(f"   Reasoning: {plan.get('reasoning')}")
+        return plan
+
+    auto = auto_resolution(query, time_period)
+    if auto:
+        # Short window or dated event: the right cadence is obvious, no LLM round-trip.
+        res, why = auto
+        plan = build_resolution_plan(time_period, res, reason=why)
+        plan = normalise_plan(plan, time_period)
+        print(f"📋 ANALYSIS STRATEGY (auto): {plan.get('strategy_type')}, "
               f"{len(plan.get('time_periods', []))} periods, resolution={plan.get('resolution')}")
         print(f"   Reasoning: {plan.get('reasoning')}")
         return plan
