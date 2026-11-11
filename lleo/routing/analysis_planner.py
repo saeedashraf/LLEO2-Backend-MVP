@@ -98,9 +98,10 @@ def resolve_window(time_period: Dict[str, Any], today: Optional[date] = None) ->
         else:
             end = date(int(ey), 12, 31)
 
-    # An event date without an explicit start: include a baseline before it.
+    # An event date without an explicit *earlier* start: include a baseline
+    # before it (the router sets start_date = event_date by default).
     event = _parse_date(time_period.get("event_date"))
-    if event and time_period.get("start_date") is None:
+    if event and (time_period.get("start_date") is None or start == event):
         start = min(start, event - timedelta(days=28))
 
     start = max(start, S2_START)

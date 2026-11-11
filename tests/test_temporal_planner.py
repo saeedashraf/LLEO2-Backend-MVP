@@ -104,7 +104,8 @@ def test_weekly_plan_for_event_query():
     assert plan["comparison"]["type"] == "time_series"
     assert plan["resolution"] == "weekly"
     assert plan["event_date"] == "2026-08-26"
-    assert plan["window"] == {"start": "2026-08-26", "end": "2026-11-10"}
+    # start_date equal to the event date gets a 4-week baseline before the event
+    assert plan["window"] == {"start": "2026-07-29", "end": "2026-11-10"}
     assert 11 <= len(plan["time_periods"]) <= 12
     assert "weekly" in plan["reasoning"]
     assert plan["planner"] == "deterministic"
@@ -265,3 +266,12 @@ def test_push_step_keeps_full_trace():
         push_step(sessions, "s", f"step {i}")
     assert len(sessions["s"]["steps"]) == MAX_STEPS
     push_step(sessions, "missing", "ignored")
+
+
+def test_window_event_equal_to_start_still_gets_baseline():
+    s, _ = ap.resolve_window({"start_year": 2026, "start_date": "2026-08-26",
+                              "event_date": "2026-08-26"}, TODAY)
+    assert s == date(2026, 7, 29)
+    s2, _ = ap.resolve_window({"start_year": 2026, "start_date": "2026-08-01",
+                               "event_date": "2026-08-26"}, TODAY)
+    assert s2 == date(2026, 8, 1)  # user asked for an earlier start: kept

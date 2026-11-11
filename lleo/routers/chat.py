@@ -230,6 +230,7 @@ async def analyze_from_conversation(
             start_date=prior.get("start_date"),
             end_date=prior.get("end_date"),
             event_date=prior.get("event_date"),
+            reasoning=prior.get("reasoning"),
             business_type=prior.get("business_type"),
             keyword=prior.get("keyword"),
             radius=prior.get("radius") or 2000,
