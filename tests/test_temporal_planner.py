@@ -275,3 +275,59 @@ def test_window_event_equal_to_start_still_gets_baseline():
     s2, _ = ap.resolve_window({"start_year": 2026, "start_date": "2026-08-01",
                                "event_date": "2026-08-26"}, TODAY)
     assert s2 == date(2026, 8, 1)  # user asked for an earlier start: kept
+
+
+# ── Animation frame planning ─────────────────────────────────────────────────
+
+def test_plan_frames_legacy_for_year_scale_requests():
+    from lleo.processors.video_animation_processor import plan_frames
+    assert plan_frames({"start_year": 2024, "end_year": 2026}, "urban growth Dubai", TODAY) is None
+
+
+def test_plan_frames_event_weekly_with_baseline_and_marker():
+    from lleo.processors.video_animation_processor import plan_frames
+    plan = plan_frames({"start_year": 2026, "start_month": 8, "end_month": 11,
+                        "start_date": "2026-08-26", "event_date": "2026-08-26"},
+                       "flood on the Trishuli after 26 August 2026", TODAY)
+    assert plan["resolution"] == "weekly" and plan["planner"] == "auto"
+    assert plan["window"]["start"] == "2026-07-29"
+    labels = [p["label"] for p in plan["periods"]]
+    assert labels[0] == "29 Jul - 02 Aug 2026"
+    after = [p["after_event"] for p in plan["periods"]]
+    assert after[:4] == [False] * 4 and all(after[5:])
+    assert 15 <= len(plan["periods"]) <= 16
+    assert "marked in red" in plan["reasoning"]
+
+
+def test_plan_frames_short_window_is_per_acquisition():
+    from lleo.processors.video_animation_processor import plan_frames
+    plan = plan_frames({"start_year": 2026, "start_date": "2026-11-01", "end_date": "2026-11-10"},
+                       "show me the last 10 days", TODAY)
+    assert plan["per_acquisition"] and plan["periods"] == []
+
+
+def test_plan_frames_caps_at_36_frames():
+    from lleo.processors.video_animation_processor import plan_frames
+    plan = plan_frames({"start_year": 2025, "end_year": 2026, "temporal_resolution": "weekly",
+                        "start_date": "2025-01-01", "end_date": "2026-11-10"}, "weekly", TODAY)
+    assert plan["resolution"] == "monthly" and len(plan["periods"]) <= 36
+    assert "cap of 36" in plan["reasoning"]
+
+
+def test_agent_coarsens_cadence_when_frames_are_sparse():
+    from lleo.services import agent_service as ag
+    from lleo.core.base_processor import AnalysisRequest
+    req = AnalysisRequest(session_id="s", user_id="u", query="flood after 26 August 2026",
+                          analysis_type="video_animation",
+                          location={"name": "x", "latitude": 28.0, "longitude": 85.0},
+                          time_period={"start_year": 2026, "end_year": 2026, "start_date": "2026-08-26",
+                                       "event_date": "2026-08-26"},
+                          parameters={})
+    obs = ag.Observation(status="completed", quality="low",
+                         metrics={"total_frames": 16, "frames_with_data": 5, "resolution": "weekly"})
+    d = ag.rule_replan(req, obs, 1)
+    assert d.action == "retry" and d.changes == {"temporal_resolution": "monthly"}
+    assert "5 of 16 weekly frames" in d.user_message
+    new = ag.apply_changes(req, d.changes)
+    assert new.time_period["temporal_resolution"] == "monthly"
+    assert ag.apply_changes(req, {"temporal_resolution": "hourly"}).time_period.get("temporal_resolution") is None

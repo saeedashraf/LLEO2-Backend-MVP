@@ -85,7 +85,8 @@ def test_observe_video_quality():
     r = _res("video_animation", {"total_frames": 3, "frames": frames})
     obs = ag.observe(_req("video_animation"), r, None)
     assert obs.quality == "low"
-    assert obs.metrics == {"total_frames": 3, "frames_with_data": 1, "scenes": None}
+    assert obs.metrics == {"total_frames": 3, "frames_with_data": 1, "scenes": None, "resolution": None}
+    assert obs.summary.startswith("Observed a thin result")
 
 
 def test_observe_business_zero():

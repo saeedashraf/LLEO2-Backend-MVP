@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import ee
@@ -40,6 +41,10 @@ from PIL import Image, ImageDraw, ImageFont
 from lleo.core.base_processor import BaseProcessor, AnalysisRequest, AnalysisResult
 from lleo.core.config import LLEOConfig
 from lleo.core.exceptions import ProcessorException, ValidationException
+from lleo.routing.analysis_planner import (
+    RESOLUTIONS, S2_REVISIT_DAYS, auto_resolution, choose_resolution,
+    generate_periods, resolve_window,
+)
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -149,6 +154,96 @@ def _plan_periods(
     return periods
 
 
+# ── Planner-driven frames (temporal resolution awareness) ───────────────────
+
+def _iso(d: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(d)[:10]) if d else None
+    except ValueError:
+        return None
+
+
+def _frame_label(period: Dict[str, Any]) -> str:
+    """Human label for a planner period (weekly gets explicit dates)."""
+    res = period.get("resolution")
+    s = _iso((period.get("date_range") or {}).get("start"))
+    last = _iso(period.get("last_day")) or s
+    if res == "weekly" and s and last:
+        if s.year == last.year:
+            return f"{s:%d %b} - {last:%d %b %Y}"
+        return f"{s:%d %b %Y} - {last:%d %b %Y}"
+    return str(period.get("label") or (s.isoformat() if s else "?"))
+
+
+def plan_frames(time_period: Dict[str, Any], query: str = "",
+                today: Optional[date] = None,
+                max_frames: int = MAX_FRAMES) -> Optional[Dict[str, Any]]:
+    """Decide the frame cadence from the router's time fields.
+
+    Returns ``None`` when the legacy monthly path should be used (year-scale
+    requests without exact dates, an event or a requested cadence).  Otherwise
+    a plan with ``resolution`` (daily = one frame per Sentinel-2 acquisition,
+    resolved later against the archive), ``periods`` (empty for daily),
+    ``window``, ``event_date`` and ``reasoning``.
+    """
+    today = today or date.today()
+    tp = dict(time_period or {})
+    requested = tp.get("temporal_resolution")
+    explicit = requested in RESOLUTIONS
+    auto = None if explicit else auto_resolution(query, tp, today)
+    has_dates = any(tp.get(k) for k in ("start_date", "end_date", "event_date"))
+    if not explicit and auto is None and not has_dates:
+        return None
+
+    start, end = resolve_window(tp, today)
+    if explicit:
+        requested_res, reason = requested, (
+            f"The user asked for {requested} frames over {start.isoformat()} to {end.isoformat()}."
+        )
+    elif auto is not None:
+        requested_res, reason = auto
+    else:
+        requested_res = "monthly"
+        reason = (f"Exact dates were given without a cadence; monthly frames cover "
+                  f"{start.isoformat()} to {end.isoformat()}.")
+
+    effective, notes = choose_resolution(start, end, requested_res, max_periods=max_frames)
+    event = _iso(tp.get("event_date"))
+    reasoning = [reason]
+    if effective == "daily":
+        reasoning.append(
+            f"Each frame is one Sentinel-2 acquisition date (revisit about {S2_REVISIT_DAYS} days); "
+            f"at most {max_frames} frames are rendered.")
+    else:
+        reasoning.append(
+            f"Each frame is a cloud-masked median of the Sentinel-2 scenes in that "
+            f"{effective.rstrip('ly') if effective != 'daily' else 'day'} window; windows without a clear scene are skipped.")
+    if event:
+        reasoning.append(f"Frames after the {event.isoformat()} event are marked in red.")
+    reasoning.extend(notes)
+
+    periods: List[Dict[str, Any]] = []
+    if effective != "daily":
+        for p in generate_periods(start, end, effective):
+            s = _iso(p["date_range"]["start"])
+            periods.append({
+                "label": _frame_label(p),
+                "start": p["date_range"]["start"],
+                "end": p["date_range"]["end"],          # exclusive
+                "after_event": bool(event and s and s >= event),
+            })
+    return {
+        "resolution": effective,
+        "requested_resolution": requested_res,
+        "per_acquisition": effective == "daily",
+        "planner": "deterministic" if explicit else "auto",
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "event_date": event.isoformat() if event else None,
+        "reasoning": " ".join(reasoning),
+        "periods": periods,
+    }
+
+
 # ── Font loading (best-effort cross-platform) ────────────────────────────────
 
 _FONT_PATHS = {
@@ -200,6 +295,7 @@ def _annotate_frame(
     frame_idx: int,
     total_frames: int,
     n_ticks: int = 3,
+    tag: Optional[str] = None,
 ) -> Image.Image:
     """
     Add a black border around the frame with lat/lon axis labels on all 4 sides
@@ -278,6 +374,12 @@ def _annotate_frame(
     tx = M_LEFT + iw - tw - pad
     ty = M_TOP + pad
     shadow_text((tx, ty), timestamp, big, fill="#FFD700")
+    if tag:
+        # Red marker under the timestamp (e.g. "after 26 Aug 2026 event")
+        bbox_g = draw.textbbox((0, 0), tag, font=small)
+        gw = bbox_g[2] - bbox_g[0]
+        th = bbox_t[3] - bbox_t[1]
+        shadow_text((M_LEFT + iw - gw - pad, ty + th + 10), tag, small, fill="#FF5A5A")
 
     # ── Frame counter top-left (inside the image) ───────────────────────
     counter = f"{frame_idx}/{total_frames}"
@@ -420,10 +522,39 @@ class VideoAnimationProcessor(BaseProcessor):
                 session_id=sid,
             )
 
-            # ── Build monthly composites + scene counts ────────────────────
-            frame_specs = self._build_monthly_specs(
-                aoi, start_year, end_year, start_month, end_month,
-            )
+            # ── Plan the frame cadence (planner) or fall back to months ────
+            plan = plan_frames(request.time_period, request.query)
+            event_tag = None
+            if plan is not None:
+                self._progress("Planning the animation frames (window and cadence)…")
+                base = self._base_collection(aoi)
+                if plan["per_acquisition"]:
+                    self._progress("Listing Sentinel-2 acquisition dates for per-image frames…")
+                    dates = self._acquisition_dates(base, plan["window"]["start"], plan["window"]["end"])
+                    ev = _iso(plan.get("event_date"))
+                    plan["periods"] = [{
+                        "label": f"{d:%d %b %Y}",
+                        "start": d.isoformat(),
+                        "end": (d + timedelta(days=1)).isoformat(),
+                        "after_event": bool(ev and d >= ev),
+                    } for d in dates]
+                    if not plan["periods"]:
+                        raise ProcessorException(
+                            f"No clear scenes found between {plan['window']['start']} "
+                            f"and {plan['window']['end']}."
+                        )
+                frame_specs = self._build_period_specs(base, plan["periods"])
+                if plan.get("event_date"):
+                    ev = _iso(plan["event_date"])
+                    event_tag = f"after {ev:%d %b %Y} event" if ev else None
+                self._progress(
+                    f"Plan: {len(frame_specs)} {plan['resolution']} frames from "
+                    f"{plan['window']['start']} to {plan['window']['end']}. {plan['reasoning']}"
+                )
+            else:
+                frame_specs = self._build_monthly_specs(
+                    aoi, start_year, end_year, start_month, end_month,
+                )
             num_frames = len(frame_specs)
             if num_frames < 2:
                 raise ProcessorException(
@@ -435,7 +566,40 @@ class VideoAnimationProcessor(BaseProcessor):
                 f"Counting scenes per month for {num_frames} frames…",
                 session_id=sid,
             )
+            self._progress(f"Counting clear Sentinel-2 scenes for {num_frames} frames in Earth Engine…")
             scene_counts = ee.List([s["count"] for s in frame_specs]).getInfo()
+
+            # Planner path: frames without a clear scene are skipped, not blacked out
+            per_frame_summary: List[Dict[str, Any]] = [None] * num_frames  # type: ignore[list-item]
+            if plan is not None:
+                render = [i for i, c in enumerate(scene_counts) if int(c) > 0]
+                gaps = [frame_specs[i]["label"] for i, c in enumerate(scene_counts) if int(c) == 0]
+                self._progress(
+                    "Clear scenes per frame: " + ", ".join(
+                        f"{s['label']}: {int(c)}" for s, c in zip(frame_specs, scene_counts))
+                )
+                if gaps:
+                    self._progress(f"{len(gaps)} of {num_frames} frames have no clear scene and are skipped")
+                for i in range(num_frames):
+                    if int(scene_counts[i]) == 0:
+                        spec = frame_specs[i]
+                        per_frame_summary[i] = {
+                            "frame": None, "year": spec["year"], "month": spec["month"],
+                            "months_composited": spec["months"], "label": spec["label"],
+                            "start": spec.get("start"), "end": spec.get("end"),
+                            "scenes_composited": 0, "had_data": False,
+                            "after_event": spec.get("after_event", False),
+                        }
+                if len(render) < 2:
+                    raise ProcessorException(
+                        f"No clear scenes found for {num_frames - len(render)} of {num_frames} "
+                        f"planned {plan['resolution']} frames between {plan['window']['start']} "
+                        f"and {plan['window']['end']}."
+                    )
+            else:
+                render = list(range(num_frames))
+                gaps = []
+            n_render = len(render)
 
             # ── Download + annotate each frame in parallel ──────────────────
             tmp_dir = os.path.join("/tmp/lleo", sid)
@@ -443,15 +607,15 @@ class VideoAnimationProcessor(BaseProcessor):
             frame_bbox = (west, south, east, north)
 
             self.log_info(
-                f"Downloading {num_frames} frames at {dimension}px (parallel x{PARALLEL_DOWNLOADS})…",
+                f"Downloading {n_render} frames at {dimension}px (parallel x{PARALLEL_DOWNLOADS})…",
                 session_id=sid,
             )
+            self._progress(f"Rendering {n_render} frames at {dimension}px ({PARALLEL_DOWNLOADS} in parallel)…")
             # Frames are stored already quantised to a 256-colour palette so
             # that the (slow, single-threaded) palette search happens inside
             # the worker threads instead of serially during GIF encoding.
-            pil_frames: List[Image.Image] = [None] * num_frames  # type: ignore[list-item]
+            pil_frames: List[Image.Image] = [None] * n_render  # type: ignore[list-item]
             rgb_last: List[Optional[Image.Image]] = [None]
-            per_frame_summary: List[Dict[str, Any]] = [None] * num_frames  # type: ignore[list-item]
             thumb_params = {
                 "dimensions": dimension,
                 "region": aoi,
@@ -459,7 +623,8 @@ class VideoAnimationProcessor(BaseProcessor):
                 "crs": "EPSG:3857",
             }
 
-            def _fetch_one(idx: int) -> None:
+            def _fetch_one(j: int) -> None:
+                idx = render[j]
                 spec = frame_specs[idx]
                 count = int(scene_counts[idx])
                 label = spec["label"]
@@ -473,37 +638,43 @@ class VideoAnimationProcessor(BaseProcessor):
                     img = Image.open(io.BytesIO(raw)).convert("RGB")
 
                 annotated = _annotate_frame(
-                    img, label, frame_bbox, idx + 1, num_frames,
+                    img, label, frame_bbox, j + 1, n_render,
+                    tag=event_tag if spec.get("after_event") else None,
                 )
-                if idx == num_frames - 1:
+                if j == n_render - 1:
                     rgb_last[0] = annotated
-                pil_frames[idx] = annotated.quantize(
+                pil_frames[j] = annotated.quantize(
                     colors=GIF_COLORS, method=Image.Quantize.MEDIANCUT,
                 )
                 per_frame_summary[idx] = {
-                    "frame": idx + 1,
+                    "frame": j + 1,
                     "year": spec["year"],
                     "month": spec["month"],
                     "months_composited": spec["months"],
                     "label": label,
+                    "start": spec.get("start"),
+                    "end": spec.get("end"),
                     "scenes_composited": count,
                     "had_data": count > 0,
+                    "after_event": spec.get("after_event", False),
                 }
 
             with ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as ex:
-                futures = [ex.submit(_fetch_one, i) for i in range(num_frames)]
+                futures = [ex.submit(_fetch_one, i) for i in range(n_render)]
                 for done, fut in enumerate(as_completed(futures), 1):
                     fut.result()  # raise any error
-                    if done % 6 == 0 or done == num_frames:
+                    if done % 6 == 0 or done == n_render:
                         self.log_info(
-                            f"  …{done}/{num_frames} frames ready",
+                            f"  …{done}/{n_render} frames ready",
                             session_id=sid,
                         )
+                        self._progress(f"{done} of {n_render} frames rendered")
 
             # ── Stitch GIF locally ──────────────────────────────────────────
             gif_path = os.path.join(tmp_dir, "animation.gif")
             preview_path = os.path.join(tmp_dir, "preview.png")
             self.log_info("Stitching GIF…", session_id=sid)
+            self._progress("Encoding the GIF…")
             t_enc = time.time()
             pil_frames[0].save(
                 gif_path,
@@ -531,6 +702,29 @@ class VideoAnimationProcessor(BaseProcessor):
                     scenes_per_year.get(yk, 0) + entry["scenes_composited"]
                 )
 
+            if plan is not None:
+                res_word = plan["resolution"]
+                compositing = (
+                    "single Sentinel-2 acquisition + SCL cloud/shadow/cirrus mask"
+                    if res_word == "daily" else
+                    f"{res_word} median + SCL cloud/shadow/cirrus mask"
+                )
+                date_range_str = f"{plan['window']['start']} to {plan['window']['end']}"
+                plan_summary = (
+                    f"Planned {num_frames} {res_word} frames from {plan['window']['start']} to "
+                    f"{plan['window']['end']}, {n_render} with clear Sentinel-2 scenes"
+                    + (f" and {len(gaps)} skipped for clouds or no acquisition" if gaps else "")
+                    + f". Planner reasoning: {plan['reasoning']}"
+                )
+            else:
+                compositing = (
+                    "monthly median + SCL cloud/shadow/cirrus mask"
+                    if frame_specs[0]["months"] == 1 else
+                    f"{frame_specs[0]['months']}-month median + SCL cloud/shadow/cirrus mask"
+                )
+                date_range_str = f"{start_year}-{start_month:02d} to {end_year}-{end_month:02d}"
+                plan_summary = None
+
             summary = {
                 "location_name": location_name,
                 "coordinates": {"lat": lat, "lon": lon},
@@ -540,16 +734,10 @@ class VideoAnimationProcessor(BaseProcessor):
                 "resolution_native_m": 10,
                 "rendered_dimension_px": dimension,
                 "months_per_frame": frame_specs[0]["months"],
-                "compositing_method": (
-                    "monthly median + SCL cloud/shadow/cirrus mask"
-                    if frame_specs[0]["months"] == 1 else
-                    f"{frame_specs[0]['months']}-month median + SCL cloud/shadow/cirrus mask"
-                ),
-                "date_range": (
-                    f"{start_year}-{start_month:02d} to "
-                    f"{end_year}-{end_month:02d}"
-                ),
+                "compositing_method": compositing,
+                "date_range": date_range_str,
                 "total_frames": num_frames,
+                "rendered_frames": n_render,
                 "total_scenes_composited": sum(scene_counts),
                 "frames_per_year": frames_per_year,
                 "scenes_per_year": scenes_per_year,
@@ -557,6 +745,14 @@ class VideoAnimationProcessor(BaseProcessor):
                 "frames": per_frame_summary,
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             }
+            if plan is not None:
+                summary["plan"] = {k: v for k, v in plan.items() if k != "periods"}
+                summary["plan"]["frames_planned"] = num_frames
+                summary["plan"]["frames_with_data"] = n_render
+                summary["plan"]["gaps"] = gaps
+                summary["plan_summary"] = plan_summary
+                summary["data_coverage"] = {"periods": num_frames, "with_data": n_render, "gaps": gaps}
+                self._progress(plan_summary)
             summary_path = os.path.join(tmp_dir, "summary.json")
             with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -653,7 +849,58 @@ class VideoAnimationProcessor(BaseProcessor):
             f"after {UPLOAD_RETRIES} attempts."
         )
 
+    # ── Progress (shown as reasoning steps) ─────────────────────────────────
+
+    def _progress(self, message: str) -> None:
+        cb = getattr(self, "progress_cb", None)
+        if cb:
+            try:
+                cb(message)
+            except Exception:
+                pass
+
     # ── GEE pipeline ─────────────────────────────────────────────────────────
+
+    def _base_collection(self, aoi: ee.Geometry) -> ee.ImageCollection:
+        return (
+            ee.ImageCollection(S2_COLLECTION)
+            .filterBounds(aoi)
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 80))
+            .map(_mask_s2_clouds)
+        )
+
+    def _acquisition_dates(self, base: ee.ImageCollection, start: str, end: str,
+                           max_frames: int = MAX_FRAMES) -> List[date]:
+        """Distinct Sentinel-2 acquisition dates in [start, end] (one round-trip)."""
+        end_excl = (_iso(end) + timedelta(days=1)).isoformat()
+        stamps = base.filterDate(start, end_excl).aggregate_array("system:time_start").getInfo() or []
+        days = sorted({date.fromtimestamp(int(t) / 1000).isoformat() for t in stamps})
+        if len(days) > max_frames:
+            stride = math.ceil(len(days) / max_frames)
+            days = days[::stride]
+        return [date.fromisoformat(d) for d in days]
+
+    def _build_period_specs(self, base: ee.ImageCollection,
+                            periods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """One median composite per planner period ({label, start, end exclusive})."""
+        specs: List[Dict[str, Any]] = []
+        for p in periods:
+            s = _iso(p["start"])
+            subset = base.filterDate(p["start"], p["end"])
+            composite = ee.Image(0).blend(subset.median())
+            rgb = composite.visualize(bands=S2_VIS_BANDS, min=S2_VIS_MIN, max=S2_VIS_MAX)
+            specs.append({
+                "year": s.year if s else None,
+                "month": s.month if s else None,
+                "months": 0,
+                "label": p["label"],
+                "start": p["start"],
+                "end": p["end"],
+                "after_event": bool(p.get("after_event")),
+                "image": rgb,
+                "count": subset.size(),
+            })
+        return specs
 
     def _build_monthly_specs(
         self,

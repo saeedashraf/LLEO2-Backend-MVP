@@ -179,8 +179,9 @@ def generate_periods(start: date, end: date, resolution: str) -> List[Dict[str, 
     return periods
 
 
-def choose_resolution(start: date, end: date, requested: str) -> Tuple[str, List[str]]:
-    """Apply sanity caps: coarsen until the period count fits MAX_PERIODS.
+def choose_resolution(start: date, end: date, requested: str,
+                      max_periods: int = MAX_PERIODS) -> Tuple[str, List[str]]:
+    """Apply sanity caps: coarsen until the period count fits ``max_periods``.
 
     Returns (effective_resolution, notes) where notes explain each change.
     """
@@ -197,11 +198,11 @@ def choose_resolution(start: date, end: date, requested: str) -> Tuple[str, List
 
     while res != "daily":
         n = len(generate_periods(start, end, res))
-        if n <= MAX_PERIODS or res == "annual":
+        if n <= max_periods or res == "annual":
             break
         nxt = COARSER[res]
         notes.append(
-            f"{n} {res} periods would exceed the cap of {MAX_PERIODS}, "
+            f"{n} {res} periods would exceed the cap of {max_periods}, "
             f"so the series was coarsened to {nxt}."
         )
         res = nxt

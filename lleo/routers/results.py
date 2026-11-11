@@ -15,7 +15,9 @@ GET  /files/{session_id}/{filename}    — serve GCS artefact
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json as _json
 import os
 import secrets as _secrets
 from datetime import datetime
@@ -290,6 +292,55 @@ async def get_analysis_status(session_id: str, db: Session = Depends(get_db)):
     if analysis.status == "failed" and analysis.results_data:
         resp["error"] = analysis.results_data.get("error", "Unknown error")
     return resp
+
+
+# ── GET /status/{session_id}/stream ──────────────────────────────────────────
+
+STREAM_MAX_SECONDS = 1500
+STREAM_HEARTBEAT = 15
+
+
+@router.get("/status/{session_id}/stream")
+async def stream_analysis_status(session_id: str):
+    """Server-sent events: the reasoning trace as it grows (1 s granularity).
+
+    Each event carries the full ``steps`` list plus status/progress/message;
+    the stream ends with the terminal status.  Polling /status stays the
+    source of truth for results, this only makes the trace live.
+    """
+    async def gen():
+        last_key = None
+        t_end = asyncio.get_event_loop().time() + STREAM_MAX_SECONDS
+        last_sent = 0.0
+        while asyncio.get_event_loop().time() < t_end:
+            mem = services.analysis_sessions.get(session_id)
+            if not mem:
+                yield "event: end\ndata: {\"status\": \"unknown\"}\n\n"
+                return
+            steps = list(mem.get("steps") or [])
+            status = mem.get("status", "processing")
+            key = (len(steps), status, mem.get("message"))
+            now = asyncio.get_event_loop().time()
+            if key != last_key or now - last_sent > STREAM_HEARTBEAT:
+                payload = {
+                    "session_id": session_id,
+                    "status": status,
+                    "progress": mem.get("progress", 0),
+                    "message": mem.get("message", ""),
+                    "steps": steps,
+                }
+                yield f"data: {_json.dumps(payload, default=str)}\n\n"
+                last_key, last_sent = key, now
+            if status in ("completed", "failed"):
+                yield "event: end\ndata: {}\n\n"
+                return
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── GET /gallery/{user_id} ───────────────────────────────────────────────────

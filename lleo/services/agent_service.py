@@ -38,6 +38,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from ..core.base_processor import AnalysisRequest, AnalysisResult
+from ..routing.analysis_planner import auto_resolution
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ KNOBS: Dict[str, Dict[str, Dict[str, Any]]] = {
         "start_year": {"min": 2015},
         "end_year": {"max": "now"},
         "cloud_cover_threshold": {"min": 10, "max": 80},
+        "temporal_resolution": {"choices": ("daily", "weekly", "monthly", "seasonal", "annual")},
     },
     "air_quality": {
         "start_year": {"min": 2018},
@@ -78,12 +80,14 @@ KNOBS: Dict[str, Dict[str, Dict[str, Any]]] = {
         "end_month": {"min": 1, "max": 12},
         "distance": {"min": 1000, "max": 25000},
         "dimension": {"min": 512, "max": 1024},
+        "temporal_resolution": {"choices": ("daily", "weekly", "monthly", "seasonal", "annual")},
     },
     "business_location": {
         "radius": {"min": 500, "max": 10000},
     },
 }
-TIME_KEYS = ("start_year", "end_year", "start_month", "end_month")
+TIME_KEYS = ("start_year", "end_year", "start_month", "end_month", "temporal_resolution")
+_COARSER = {"daily": "weekly", "weekly": "monthly", "monthly": "seasonal", "seasonal": "annual"}
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -177,6 +181,7 @@ def observe(request: AnalysisRequest, result: Optional[AnalysisResult],
             "total_frames": total,
             "frames_with_data": with_data,
             "scenes": meta.get("total_scenes_composited"),
+            "resolution": (meta.get("plan") or {}).get("resolution"),
         }
         if total == 0 or with_data == 0:
             quality = "none"
@@ -207,7 +212,8 @@ def observe(request: AnalysisRequest, result: Optional[AnalysisResult],
         n_periods = int(cov.get("periods") or 0)
         n_with = int(cov.get("with_data") or 0)
         metrics = {"periods": n_periods, "periods_with_data": n_with,
-                   "cloud_cover_threshold": meta.get("cloud_cover_threshold")}
+                   "cloud_cover_threshold": meta.get("cloud_cover_threshold"),
+                   "resolution": (meta.get("plan") or {}).get("resolution")}
         if n_periods and n_with == 0:
             quality = "none"
         elif n_periods and n_with / n_periods < 0.5:
@@ -225,8 +231,24 @@ def observe(request: AnalysisRequest, result: Optional[AnalysisResult],
 
     return Observation(
         status="completed", quality=quality, metrics=metrics,
-        summary=f"Tool completed (quality={quality}) metrics={metrics}",
+        summary=_describe_observation(quality, metrics),
     )
+
+
+_QUALITY_WORDS = {"ok": "a usable result", "low": "a thin result", "none": "no usable data"}
+
+
+def _describe_observation(quality: str, metrics: Dict[str, Any]) -> str:
+    """Plain-language observation for the reasoning trace."""
+    facts = ", ".join(
+        f"{k.replace('_', ' ')} {v}" for k, v in metrics.items() if v not in (None, "", [])
+    )
+    head = f"Observed {_QUALITY_WORDS.get(quality, quality)}"
+    return f"{head} ({facts})" if facts else head
+
+
+def _describe_changes(changes: Dict[str, Any]) -> str:
+    return ", ".join(f"{k.replace('_', ' ')} = {v}" for k, v in (changes or {}).items()) or "none"
 
 
 # ── RE-PLAN: deterministic rules (cheap, predictable) ────────────────────────
@@ -281,6 +303,24 @@ def rule_replan(req: AnalysisRequest, obs: Observation, attempt: int) -> Optiona
                             reason=f"few periods had clear Sentinel-2 scenes at <{cc}% cloud; relaxing to {ncc}%",
                             user_message=f"Many periods had no cloud-free Sentinel-2 image at <{cc}% cloud cover. Retrying with a more lenient {ncc}% threshold.")
 
+    # ── planner path (exact dates / event / cadence): coarsen the cadence first
+    planner_path = any(tp.get(k) for k in ("temporal_resolution", "start_date", "end_date", "event_date"))
+    if atype in ("video_animation", "water_quality") and planner_path and (no_data or thin):
+        res = obs.metrics.get("resolution") or tp.get("temporal_resolution")
+        if not res:
+            auto = auto_resolution(req.query or "", tp)
+            res = auto[0] if auto else None
+        nxt = _COARSER.get(res or "")
+        if nxt and (atype == "video_animation" or no_data):
+            unit = "frames" if atype == "video_animation" else "periods"
+            with_data = obs.metrics.get("frames_with_data", obs.metrics.get("periods_with_data"))
+            total = obs.metrics.get("total_frames", obs.metrics.get("periods"))
+            detail = (f"Only {with_data} of {total} {res} {unit} had a clear Sentinel-2 scene."
+                      if total else f"No clear Sentinel-2 scene for the {res} {unit}.")
+            return Decision("retry", {"temporal_resolution": nxt},
+                            reason=f"{res} {unit} too sparse; coarsening to {nxt}",
+                            user_message=f"{detail} Retrying with {nxt} {unit}, which combine more scenes.")
+
     # ── timelapse: too long / too heavy → shrink; too few frames → widen months
     if atype == "video_animation":
         if timeout and sy and ey and span > 2:
@@ -291,11 +331,11 @@ def rule_replan(req: AnalysisRequest, obs: Observation, attempt: int) -> Optiona
             return Decision("retry", {"dimension": 512},
                             reason="still timing out; lowering frame resolution",
                             user_message="Retrying at a lower frame resolution to fit the processing budget.")
-        if no_data and (tp.get("start_month") or tp.get("end_month")):
+        if no_data and not planner_path and (tp.get("start_month") or tp.get("end_month")):
             return Decision("retry", {"start_month": 1, "end_month": 12},
                             reason="month window too narrow for 2 frames; using full years",
                             user_message="The month window was too narrow — retrying with full calendar years.")
-        if (no_data or thin) and sy and ey and ey < now:
+        if (no_data or thin) and not planner_path and sy and ey and ey < now:
             return Decision("retry", {"end_year": min(now, ey + 1), "start_year": min(sy + 1, min(now, ey + 1) - 1)},
                             reason="few frames had data; shifting the window one year later",
                             user_message="Most frames had no clear scenes — shifting the window one year later.")
@@ -432,11 +472,17 @@ def apply_changes(req: AnalysisRequest, changes: Dict[str, Any]) -> AnalysisRequ
     for k, v in (changes or {}).items():
         if k not in knobs:
             continue
+        b = knobs[k]
+        if "choices" in b:
+            v = str(v or "").lower()
+            if v not in b["choices"]:
+                continue
+            (new.time_period if k in TIME_KEYS else new.parameters)[k] = v
+            continue
         try:
             v = int(v)
         except (TypeError, ValueError):
             continue
-        b = knobs[k]
         lo = b.get("min")
         hi = now if b.get("max") == "now" else b.get("max")
         if lo is not None:
@@ -504,6 +550,7 @@ def run_agent(
     best_obs: Optional[Observation] = None
     last_exc: Optional[BaseException] = None
     user_msg = ""
+    last_decision: Optional[Decision] = None
 
     def step(n: int, msg: str) -> None:
         print(f"🤖 agent[{n}/{max_attempts}] {msg}")
@@ -514,8 +561,9 @@ def run_agent(
                 pass
 
     for n in range(1, max_attempts + 1):
-        if n > 1:
-            step(n, f"retrying with time={current.time_period} params={current.parameters}")
+        if n > 1 and last_decision is not None:
+            why = last_decision.user_message or last_decision.reason or "re-planning"
+            step(n, f"Re-planning: {why} Changed: {_describe_changes(last_decision.changes)}.")
         _configure_processor(processor, current)
         t0 = time.time()
         result: Optional[AnalysisResult] = None
@@ -549,6 +597,7 @@ def run_agent(
             break
         # retry
         user_msg = decision.user_message or user_msg
+        last_decision = decision
         nxt = apply_changes(current, decision.changes)
         sig = _signature(nxt)
         if sig in seen:
