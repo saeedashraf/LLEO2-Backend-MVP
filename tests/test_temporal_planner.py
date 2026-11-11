@@ -106,7 +106,7 @@ def test_weekly_plan_for_event_query():
     assert plan["event_date"] == "2026-08-26"
     # start_date equal to the event date gets a 4-week baseline before the event
     assert plan["window"] == {"start": "2026-07-29", "end": "2026-11-10"}
-    assert 11 <= len(plan["time_periods"]) <= 12
+    assert 15 <= len(plan["time_periods"]) <= 16  # 4 baseline weeks + 11 to 12 after the event
     assert "weekly" in plan["reasoning"]
     assert plan["planner"] == "deterministic"
 
